@@ -19,7 +19,9 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose --release
+      run: |
+          rustup target add wasm32-wasi
+          cargo build --verbose --release --target wasm32-wasi
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v3
       with:
