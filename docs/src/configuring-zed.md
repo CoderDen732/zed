@@ -110,14 +110,15 @@ The name of any font family installed on the user's system
 
 **Options**
 
-Zed supports a subset of OpenType features that can be enabled or disabled for a given buffer or terminal font. The following [OpenType features](https://en.wikipedia.org/wiki/List_of_typographic_features) can be enabled or disabled too: `calt`, `case`, `cpsp`, `frac`, `liga`, `onum`, `ordn`, `pnum`, `ss01`, `ss02`, `ss03`, `ss04`, `ss05`, `ss06`, `ss07`, `ss08`, `ss09`, `ss10`, `ss11`, `ss12`, `ss13`, `ss14`, `ss15`, `ss16`, `ss17`, `ss18`, `ss19`, `ss20`, `subs`, `sups`, `swsh`, `titl`, `tnum`, `zero`.
+Zed supports all OpenType features that can be enabled, disabled or set a value to a font feature for a given buffer or terminal font.
 
-For example, to disable ligatures for a given font you can add the following to your settings:
+For example, to disable ligatures and set `7` to `cv01` for a given font you can add the following to your settings:
 
 ```json
 {
   "buffer_font_features": {
-    "calt": false
+    "calt": false,
+    "cv01": 7
   }
 }
 ```
@@ -1567,7 +1568,7 @@ Run the `theme selector: toggle` action in the command palette to see a current 
   // Join calls with the microphone live by default
   "mute_on_join": false,
   // Share your project when you are the first to join a channel
-  "share_on_join": true
+  "share_on_join": false
 },
 ```
 

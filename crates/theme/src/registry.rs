@@ -1,5 +1,5 @@
-use std::path::Path;
 use std::sync::Arc;
+use std::{fmt::Debug, path::Path};
 
 use anyhow::{anyhow, Context, Result};
 use collections::HashMap;
@@ -137,6 +137,10 @@ impl ThemeRegistry {
                                 .color
                                 .as_ref()
                                 .and_then(|color| try_parse_color(color).ok()),
+                            background_color: highlight
+                                .background_color
+                                .as_ref()
+                                .and_then(|color| try_parse_color(color).ok()),
                             font_style: highlight.font_style.map(Into::into),
                             font_weight: highlight.font_weight.map(Into::into),
                             ..Default::default()
@@ -222,7 +226,7 @@ impl ThemeRegistry {
             .filter(|path| path.ends_with(".json"));
 
         for path in theme_paths {
-            let Some(theme) = self.assets.load(&path).log_err() else {
+            let Some(theme) = self.assets.load(&path).log_err().flatten() else {
                 continue;
             };
 

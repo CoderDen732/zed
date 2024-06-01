@@ -423,6 +423,8 @@ pub struct Completion {
     pub lsp_completion: lsp::CompletionItem,
     /// An optional callback to invoke when this completion is confirmed.
     pub confirm: Option<Arc<dyn Send + Sync + Fn(&mut WindowContext)>>,
+    /// If true, the editor will show a new completion menu after this completion is confirmed.
+    pub show_new_completions_on_confirm: bool,
 }
 
 impl std::fmt::Debug for Completion {
@@ -7854,10 +7856,7 @@ impl Project {
                                     None
                                 } else {
                                     let relative_path = repo.relativize(&snapshot, &path).ok()?;
-                                    local_repo_entry
-                                        .repo()
-                                        .lock()
-                                        .load_index_text(&relative_path)
+                                    local_repo_entry.repo().load_index_text(&relative_path)
                                 };
                                 Some((buffer, base_text))
                             }
@@ -8192,7 +8191,7 @@ impl Project {
         &self,
         project_path: &ProjectPath,
         cx: &AppContext,
-    ) -> Option<Arc<Mutex<dyn GitRepository>>> {
+    ) -> Option<Arc<dyn GitRepository>> {
         self.worktree_for_id(project_path.worktree_id, cx)?
             .read(cx)
             .as_local()?
@@ -8200,10 +8199,7 @@ impl Project {
             .local_git_repo(&project_path.path)
     }
 
-    pub fn get_first_worktree_root_repo(
-        &self,
-        cx: &AppContext,
-    ) -> Option<Arc<Mutex<dyn GitRepository>>> {
+    pub fn get_first_worktree_root_repo(&self, cx: &AppContext) -> Option<Arc<dyn GitRepository>> {
         let worktree = self.visible_worktrees(cx).next()?.read(cx).as_local()?;
         let root_entry = worktree.root_git_entry()?;
 
@@ -8253,8 +8249,7 @@ impl Project {
 
             cx.background_executor().spawn(async move {
                 let (repo, relative_path, content) = blame_params?;
-                let lock = repo.lock();
-                lock.blame(&relative_path, content)
+                repo.blame(&relative_path, content)
                     .with_context(|| format!("Failed to blame {:?}", relative_path.0))
             })
         } else {
@@ -9252,6 +9247,7 @@ impl Project {
                         filter_range: Default::default(),
                     },
                     confirm: None,
+                    show_new_completions_on_confirm: false,
                 },
                 false,
                 cx,
@@ -10924,6 +10920,7 @@ async fn populate_labels_for_completions(
             documentation,
             lsp_completion,
             confirm: None,
+            show_new_completions_on_confirm: false,
         })
     }
 }

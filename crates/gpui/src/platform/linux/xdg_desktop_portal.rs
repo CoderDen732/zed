@@ -6,7 +6,6 @@ use std::future::Future;
 use ashpd::desktop::settings::{ColorScheme, Settings};
 use calloop::channel::{Channel, Sender};
 use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
-use parking_lot::Mutex;
 use smol::stream::StreamExt;
 use util::ResultExt;
 
@@ -115,6 +114,7 @@ impl WindowAppearance {
         }
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn set_native(&mut self, cs: ColorScheme) {
         *self = Self::from_native(cs);
     }
@@ -129,5 +129,16 @@ pub fn window_appearance(executor: &BackgroundExecutor) -> Result<WindowAppearan
         let appearance = WindowAppearance::from_native(scheme);
 
         Ok(appearance)
+    })
+}
+
+pub fn should_auto_hide_scrollbars(executor: &BackgroundExecutor) -> Result<bool, anyhow::Error> {
+    executor.block(async {
+        let settings = Settings::new().await?;
+        let auto_hide = settings
+            .read::<bool>("org.gnome.desktop.interface", "overlay-scrolling")
+            .await?;
+
+        Ok(auto_hide)
     })
 }

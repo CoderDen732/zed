@@ -25,11 +25,11 @@ impl SlashCommand for PromptSlashCommand {
     }
 
     fn description(&self) -> String {
-        "insert a prompt from the library".into()
+        "insert prompt from library".into()
     }
 
-    fn tooltip_text(&self) -> String {
-        "insert prompt".into()
+    fn menu_text(&self) -> String {
+        "Insert Prompt from Library".into()
     }
 
     fn requires_argument(&self) -> bool {
@@ -40,6 +40,7 @@ impl SlashCommand for PromptSlashCommand {
         &self,
         query: String,
         cancellation_flag: Arc<AtomicBool>,
+        _workspace: WeakView<Workspace>,
         cx: &mut AppContext,
     ) -> Task<Result<Vec<String>>> {
         let library = self.library.clone();

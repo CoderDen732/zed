@@ -94,17 +94,18 @@ impl SlashCommand for ProjectSlashCommand {
     }
 
     fn description(&self) -> String {
-        "insert current project context".into()
+        "insert project metadata".into()
     }
 
-    fn tooltip_text(&self) -> String {
-        "insert current project context".into()
+    fn menu_text(&self) -> String {
+        "Insert Project Metadata".into()
     }
 
     fn complete_argument(
         &self,
         _query: String,
         _cancel: Arc<AtomicBool>,
+        _workspace: WeakView<Workspace>,
         _cx: &mut AppContext,
     ) -> Task<Result<Vec<String>>> {
         Task::ready(Err(anyhow!("this command does not require argument")))

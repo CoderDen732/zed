@@ -19,14 +19,15 @@ impl SlashCommand for ActiveSlashCommand {
         "insert active tab".into()
     }
 
-    fn tooltip_text(&self) -> String {
-        "insert active tab".into()
+    fn menu_text(&self) -> String {
+        "Insert Active Tab".into()
     }
 
     fn complete_argument(
         &self,
         _query: String,
         _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _workspace: WeakView<Workspace>,
         _cx: &mut AppContext,
     ) -> Task<Result<Vec<String>>> {
         Task::ready(Err(anyhow!("this command does not require argument")))

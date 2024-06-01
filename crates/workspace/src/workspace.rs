@@ -588,7 +588,7 @@ pub struct Workspace {
     window_edited: bool,
     active_call: Option<(Model<ActiveCall>, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
-    database_id: WorkspaceId,
+    database_id: Option<WorkspaceId>,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<Vec<Keystroke>>>,
     _subscriptions: Vec<Subscription>,
@@ -622,7 +622,7 @@ impl Workspace {
     const MAX_PADDING: f32 = 0.4;
 
     pub fn new(
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         project: Model<Project>,
         app_state: Arc<AppState>,
         cx: &mut ViewContext<Self>,
@@ -795,13 +795,15 @@ impl Workspace {
                         if let Some(display) = cx.display() {
                             if let Some(display_uuid) = display.uuid().log_err() {
                                 let window_bounds = cx.window_bounds();
-                                cx.background_executor()
-                                    .spawn(DB.set_window_open_status(
-                                        workspace_id,
-                                        SerializedWindowBounds(window_bounds),
-                                        display_uuid,
-                                    ))
-                                    .detach_and_log_err(cx);
+                                if let Some(database_id) = workspace_id {
+                                    cx.background_executor()
+                                        .spawn(DB.set_window_open_status(
+                                            database_id,
+                                            SerializedWindowBounds(window_bounds),
+                                            display_uuid,
+                                        ))
+                                        .detach_and_log_err(cx);
+                                }
                             }
                         }
                         this.bounds_save_task_queued.take();
@@ -956,7 +958,12 @@ impl Workspace {
             let window = if let Some(window) = requesting_window {
                 cx.update_window(window.into(), |_, cx| {
                     cx.replace_root_view(|cx| {
-                        Workspace::new(workspace_id, project_handle.clone(), app_state.clone(), cx)
+                        Workspace::new(
+                            Some(workspace_id),
+                            project_handle.clone(),
+                            app_state.clone(),
+                            cx,
+                        )
                     });
                 })?;
                 window
@@ -994,7 +1001,7 @@ impl Workspace {
                     move |cx| {
                         cx.new_view(|cx| {
                             let mut workspace =
-                                Workspace::new(workspace_id, project_handle, app_state, cx);
+                                Workspace::new(Some(workspace_id), project_handle, app_state, cx);
                             workspace.centered_layout = centered_layout;
                             workspace
                         })
@@ -3464,9 +3471,12 @@ impl Workspace {
     pub fn on_window_activation_changed(&mut self, cx: &mut ViewContext<Self>) {
         if cx.is_window_active() {
             self.update_active_view_for_followers(cx);
-            cx.background_executor()
-                .spawn(persistence::DB.update_timestamp(self.database_id()))
-                .detach();
+
+            if let Some(database_id) = self.database_id {
+                cx.background_executor()
+                    .spawn(persistence::DB.update_timestamp(database_id))
+                    .detach();
+            }
         } else {
             for pane in &self.panes {
                 pane.update(cx, |pane, cx| {
@@ -3506,7 +3516,7 @@ impl Workspace {
         }
     }
 
-    pub fn database_id(&self) -> WorkspaceId {
+    pub fn database_id(&self) -> Option<WorkspaceId> {
         self.database_id
     }
 
@@ -3566,6 +3576,10 @@ impl Workspace {
     }
 
     fn serialize_workspace_internal(&self, cx: &mut WindowContext) -> Task<()> {
+        let Some(database_id) = self.database_id() else {
+            return Task::ready(());
+        };
+
         fn serialize_pane_handle(pane_handle: &View<Pane>, cx: &WindowContext) -> SerializedPane {
             let (items, active) = {
                 let pane = pane_handle.read(cx);
@@ -3701,7 +3715,7 @@ impl Workspace {
             let docks = build_serialized_docks(self, cx);
             let window_bounds = Some(SerializedWindowBounds(cx.window_bounds()));
             let serialized_workspace = SerializedWorkspace {
-                id: self.database_id,
+                id: database_id,
                 location,
                 center_group,
                 window_bounds,
@@ -3944,9 +3958,11 @@ impl Workspace {
 
     pub fn toggle_centered_layout(&mut self, _: &ToggleCenteredLayout, cx: &mut ViewContext<Self>) {
         self.centered_layout = !self.centered_layout;
-        cx.background_executor()
-            .spawn(DB.set_centered_layout(self.database_id, self.centered_layout))
-            .detach_and_log_err(cx);
+        if let Some(database_id) = self.database_id() {
+            cx.background_executor()
+                .spawn(DB.set_centered_layout(database_id, self.centered_layout))
+                .detach_and_log_err(cx);
+        }
         cx.notify();
     }
 
@@ -4560,15 +4576,19 @@ async fn join_channel_internal(
         if let Some((project, host)) = room.most_active_project(cx) {
             return Some(join_in_room_project(project, host, app_state.clone(), cx));
         }
-        // if you are the first to join a channel, share your project
-        if room.remote_participants().len() == 0 && !room.local_participant_is_guest() {
+
+        // If you are the first to join a channel, see if you should share your project.
+        if room.remote_participants().is_empty() && !room.local_participant_is_guest() {
             if let Some(workspace) = requesting_window {
                 let project = workspace.update(cx, |workspace, cx| {
-                    if !CallSettings::get_global(cx).share_on_join {
+                    let project = workspace.project.read(cx);
+                    let is_dev_server = project.dev_server_project_id().is_some();
+
+                    if !is_dev_server && !CallSettings::get_global(cx).share_on_join {
                         return None;
                     }
-                    let project = workspace.project.read(cx);
-                    if (project.is_local() || project.dev_server_project_id().is_some())
+
+                    if (project.is_local() || is_dev_server)
                         && project.visible_worktrees(cx).any(|tree| {
                             tree.read(cx)
                                 .root_entry()
