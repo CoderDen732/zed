@@ -1,4 +1,4 @@
-use gpui::{relative, DefiniteLength, MouseButton};
+use gpui::{relative, CursorStyle, DefiniteLength, MouseButton};
 use gpui::{transparent_black, AnyElement, AnyView, ClickEvent, Hsla, Rems};
 use smallvec::SmallVec;
 
@@ -332,7 +332,7 @@ impl ButtonSize {
 /// This is also used to build the prebuilt buttons.
 #[derive(IntoElement)]
 pub struct ButtonLike {
-    pub base: Div,
+    pub(super) base: Div,
     id: ElementId,
     pub(super) style: ButtonStyle,
     pub(super) disabled: bool,
@@ -344,6 +344,7 @@ pub struct ButtonLike {
     size: ButtonSize,
     rounding: Option<ButtonLikeRounding>,
     tooltip: Option<Box<dyn Fn(&mut WindowContext) -> AnyView>>,
+    cursor_style: CursorStyle,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut WindowContext) + 'static>>,
     children: SmallVec<[AnyElement; 2]>,
 }
@@ -363,9 +364,18 @@ impl ButtonLike {
             rounding: Some(ButtonLikeRounding::All),
             tooltip: None,
             children: SmallVec::new(),
+            cursor_style: CursorStyle::PointingHand,
             on_click: None,
             layer: None,
         }
+    }
+
+    pub fn new_rounded_left(id: impl Into<ElementId>) -> Self {
+        Self::new(id).rounding(ButtonLikeRounding::Left)
+    }
+
+    pub fn new_rounded_right(id: impl Into<ElementId>) -> Self {
+        Self::new(id).rounding(ButtonLikeRounding::Right)
     }
 
     pub(crate) fn height(mut self, height: DefiniteLength) -> Self {
@@ -403,6 +413,11 @@ impl SelectableButton for ButtonLike {
 impl Clickable for ButtonLike {
     fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut WindowContext) + 'static) -> Self {
         self.on_click = Some(Box::new(handler));
+        self
+    }
+
+    fn cursor_style(mut self, cursor_style: CursorStyle) -> Self {
+        self.cursor_style = cursor_style;
         self
     }
 }
@@ -500,8 +515,10 @@ impl RenderOnce for ButtonLike {
                         })
                 },
             )
-            .when_some(self.tooltip, |this, tooltip| {
-                this.tooltip(move |cx| tooltip(cx))
+            .when(!self.selected, |this| {
+                this.when_some(self.tooltip, |this, tooltip| {
+                    this.tooltip(move |cx| tooltip(cx))
+                })
             })
             .children(self.children)
     }

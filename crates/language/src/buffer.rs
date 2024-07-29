@@ -17,6 +17,7 @@ use crate::{
     LanguageScope, Outline, RunnableCapture, RunnableTag,
 };
 use anyhow::{anyhow, Context, Result};
+use async_watch as watch;
 pub use clock::ReplicaId;
 use futures::channel::oneshot;
 use gpui::{
@@ -26,12 +27,14 @@ use gpui::{
 use lazy_static::lazy_static;
 use lsp::LanguageServerId;
 use parking_lot::Mutex;
+use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use smallvec::SmallVec;
 use smol::future::yield_now;
 use std::{
     any::Any,
-    cmp::{self, Ordering},
+    cell::Cell,
+    cmp::{self, Ordering, Reverse},
     collections::BTreeMap,
     ffi::OsStr,
     fmt,
@@ -103,20 +106,26 @@ pub struct Buffer {
     sync_parse_timeout: Duration,
     syntax_map: Mutex<SyntaxMap>,
     parsing_in_background: bool,
-    parse_count: usize,
+    parse_status: (watch::Sender<ParseStatus>, watch::Receiver<ParseStatus>),
+    non_text_state_update_count: usize,
     diagnostics: SmallVec<[(LanguageServerId, DiagnosticSet); 2]>,
     remote_selections: TreeMap<ReplicaId, SelectionSet>,
-    selections_update_count: usize,
-    diagnostics_update_count: usize,
     diagnostics_timestamp: clock::Lamport,
-    file_update_count: usize,
-    git_diff_update_count: usize,
     completion_triggers: Vec<String>,
     completion_triggers_timestamp: clock::Lamport,
     deferred_ops: OperationQueue<Operation>,
     capability: Capability,
     has_conflict: bool,
     diff_base_version: usize,
+    /// Memoize calls to has_changes_since(saved_version).
+    /// The contents of a cell are (self.version, has_changes) at the time of a last call.
+    has_unsaved_edits: Cell<(clock::Global, bool)>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ParseStatus {
+    Idle,
+    Parsing,
 }
 
 /// An immutable, cheaply cloneable representation of a fixed
@@ -127,13 +136,9 @@ pub struct BufferSnapshot {
     pub(crate) syntax: SyntaxSnapshot,
     file: Option<Arc<dyn File>>,
     diagnostics: SmallVec<[(LanguageServerId, DiagnosticSet); 2]>,
-    diagnostics_update_count: usize,
-    file_update_count: usize,
-    git_diff_update_count: usize,
     remote_selections: TreeMap<ReplicaId, SelectionSet>,
-    selections_update_count: usize,
     language: Option<Arc<Language>>,
-    parse_count: usize,
+    non_text_state_update_count: usize,
 }
 
 /// The kind and amount of indentation in a particular line. For now,
@@ -209,6 +214,8 @@ pub struct Diagnostic {
     pub is_disk_based: bool,
     /// Whether this diagnostic marks unnecessary code.
     pub is_unnecessary: bool,
+    /// Data from language server that produced this diagnostic. Passed back to the LS when we request code actions for this diagnostic.
+    pub data: Option<Value>,
 }
 
 /// TODO - move this into the `project` crate and make it private.
@@ -368,7 +375,7 @@ pub trait File: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Converts this file into a protobuf message.
-    fn to_proto(&self) -> rpc::proto::File;
+    fn to_proto(&self, cx: &AppContext) -> rpc::proto::File;
 
     /// Return whether Zed considers this to be a private file.
     fn is_private(&self) -> bool;
@@ -608,10 +615,10 @@ impl Buffer {
     }
 
     /// Serialize the buffer's state to a protobuf message.
-    pub fn to_proto(&self) -> proto::BufferState {
+    pub fn to_proto(&self, cx: &AppContext) -> proto::BufferState {
         proto::BufferState {
             id: self.remote_id().into(),
-            file: self.file.as_ref().map(|f| f.to_proto()),
+            file: self.file.as_ref().map(|f| f.to_proto(cx)),
             base_text: self.base_text().to_string(),
             diff_base: self.diff_base.as_ref().map(|h| h.to_string()),
             line_ending: proto::serialize_line_ending(self.line_ending()) as i32,
@@ -698,6 +705,7 @@ impl Buffer {
             reload_task: None,
             transaction_depth: 0,
             was_dirty_before_starting_transaction: None,
+            has_unsaved_edits: Cell::new((buffer.version(), false)),
             text: buffer,
             diff_base: diff_base
                 .map(|mut raw_diff_base| {
@@ -711,18 +719,15 @@ impl Buffer {
             capability,
             syntax_map: Mutex::new(SyntaxMap::new()),
             parsing_in_background: false,
-            parse_count: 0,
+            non_text_state_update_count: 0,
             sync_parse_timeout: Duration::from_millis(1),
+            parse_status: async_watch::channel(ParseStatus::Idle),
             autoindent_requests: Default::default(),
             pending_autoindent: Default::default(),
             language: None,
             remote_selections: Default::default(),
-            selections_update_count: 0,
             diagnostics: Default::default(),
-            diagnostics_update_count: 0,
             diagnostics_timestamp: Default::default(),
-            file_update_count: 0,
-            git_diff_update_count: 0,
             completion_triggers: Default::default(),
             completion_triggers_timestamp: Default::default(),
             deferred_ops: OperationQueue::new(),
@@ -745,12 +750,8 @@ impl Buffer {
             file: self.file.clone(),
             remote_selections: self.remote_selections.clone(),
             diagnostics: self.diagnostics.clone(),
-            diagnostics_update_count: self.diagnostics_update_count,
-            file_update_count: self.file_update_count,
-            git_diff_update_count: self.git_diff_update_count,
             language: self.language.clone(),
-            parse_count: self.parse_count,
-            selections_update_count: self.selections_update_count,
+            non_text_state_update_count: self.non_text_state_update_count,
         }
     }
 
@@ -782,7 +783,7 @@ impl Buffer {
 
     /// Assign a language to the buffer.
     pub fn set_language(&mut self, language: Option<Arc<Language>>, cx: &mut ModelContext<Self>) {
-        self.parse_count += 1;
+        self.non_text_state_update_count += 1;
         self.syntax_map.lock().clear();
         self.language = language;
         self.reparse(cx);
@@ -815,6 +816,8 @@ impl Buffer {
         cx: &mut ModelContext<Self>,
     ) {
         self.saved_version = version;
+        self.has_unsaved_edits
+            .set((self.saved_version().clone(), false));
         self.has_conflict = false;
         self.saved_mtime = mtime;
         cx.emit(Event::Saved);
@@ -876,6 +879,8 @@ impl Buffer {
         cx: &mut ModelContext<Self>,
     ) {
         self.saved_version = version;
+        self.has_unsaved_edits
+            .set((self.saved_version.clone(), false));
         self.text.set_line_ending(line_ending);
         self.saved_mtime = mtime;
         cx.emit(Event::Reloaded);
@@ -915,7 +920,7 @@ impl Buffer {
 
         self.file = Some(new_file);
         if file_changed {
-            self.file_update_count += 1;
+            self.non_text_state_update_count += 1;
             cx.emit(Event::FileHandleChanged);
             cx.notify();
         }
@@ -969,7 +974,7 @@ impl Buffer {
             let buffer_diff = diff.await;
             this.update(&mut cx, |this, cx| {
                 this.git_diff = buffer_diff;
-                this.git_diff_update_count += 1;
+                this.non_text_state_update_count += 1;
                 cx.emit(Event::DiffUpdated);
             })
             .ok();
@@ -992,29 +997,10 @@ impl Buffer {
             .or_else(|| self.language.clone())
     }
 
-    /// The number of times the buffer was parsed.
-    pub fn parse_count(&self) -> usize {
-        self.parse_count
-    }
-
-    /// The number of times selections were updated.
-    pub fn selections_update_count(&self) -> usize {
-        self.selections_update_count
-    }
-
-    /// The number of times diagnostics were updated.
-    pub fn diagnostics_update_count(&self) -> usize {
-        self.diagnostics_update_count
-    }
-
-    /// The number of times the underlying file was updated.
-    pub fn file_update_count(&self) -> usize {
-        self.file_update_count
-    }
-
-    /// The number of times the git diff status was updated.
-    pub fn git_diff_update_count(&self) -> usize {
-        self.git_diff_update_count
+    /// An integer version number that accounts for all updates besides
+    /// the buffer's text itself (which is versioned via a version vector).
+    pub fn non_text_state_update_count(&self) -> usize {
+        self.non_text_state_update_count
     }
 
     /// Whether the buffer is being parsed in the background.
@@ -1085,6 +1071,7 @@ impl Buffer {
             }
         });
 
+        self.parse_status.0.send(ParseStatus::Parsing).unwrap();
         match cx
             .background_executor()
             .block_with_timeout(self.sync_parse_timeout, parse_task)
@@ -1124,11 +1111,16 @@ impl Buffer {
     }
 
     fn did_finish_parsing(&mut self, syntax_snapshot: SyntaxSnapshot, cx: &mut ModelContext<Self>) {
-        self.parse_count += 1;
+        self.non_text_state_update_count += 1;
         self.syntax_map.lock().did_parse(syntax_snapshot);
         self.request_autoindent(cx);
+        self.parse_status.0.send(ParseStatus::Idle).unwrap();
         cx.emit(Event::Reparsed);
         cx.notify();
+    }
+
+    pub fn parse_status(&self) -> watch::Receiver<ParseStatus> {
+        self.parse_status.1.clone()
     }
 
     /// Assign to the buffer a set of diagnostics created by a given language server.
@@ -1410,7 +1402,7 @@ impl Buffer {
                 LineEnding::normalize(&mut new_text);
 
                 let diff = TextDiff::from_chars(old_text.as_str(), new_text.as_str());
-                let empty: Arc<str> = "".into();
+                let empty: Arc<str> = Arc::default();
 
                 let mut edits = Vec::new();
                 let mut old_offset = 0;
@@ -1551,10 +1543,25 @@ impl Buffer {
         self.end_transaction(cx)
     }
 
+    fn has_unsaved_edits(&self) -> bool {
+        let (last_version, has_unsaved_edits) = self.has_unsaved_edits.take();
+
+        if last_version == self.version {
+            self.has_unsaved_edits
+                .set((last_version, has_unsaved_edits));
+            return has_unsaved_edits;
+        }
+
+        let has_edits = self.has_edits_since(&self.saved_version);
+        self.has_unsaved_edits
+            .set((self.version.clone(), has_edits));
+        has_edits
+    }
+
     /// Checks if the buffer has unsaved changes.
     pub fn is_dirty(&self) -> bool {
         self.has_conflict
-            || self.has_edits_since(&self.saved_version)
+            || self.has_unsaved_edits()
             || self
                 .file
                 .as_ref()
@@ -1566,7 +1573,7 @@ impl Buffer {
     pub fn has_conflict(&self) -> bool {
         self.has_conflict
             || self.file.as_ref().map_or(false, |file| {
-                file.mtime() > self.saved_mtime && self.has_edits_since(&self.saved_version)
+                file.mtime() > self.saved_mtime && self.has_unsaved_edits()
             })
     }
 
@@ -1701,6 +1708,8 @@ impl Buffer {
             },
             cx,
         );
+        self.non_text_state_update_count += 1;
+        cx.notify();
     }
 
     /// Clears the selections, so that other replicas of the buffer do not see any selections for
@@ -1711,7 +1720,7 @@ impl Buffer {
             .get(&self.text.replica_id())
             .map_or(true, |set| !set.selections.is_empty())
         {
-            self.set_active_selections(Arc::from([]), false, Default::default(), cx);
+            self.set_active_selections(Arc::default(), false, Default::default(), cx);
         }
     }
 
@@ -1912,6 +1921,10 @@ impl Buffer {
         self.deferred_ops.insert(deferred_ops);
     }
 
+    pub fn has_deferred_ops(&self) -> bool {
+        !self.deferred_ops.is_empty() || self.text.has_deferred_ops()
+    }
+
     fn can_apply_op(&self, operation: &Operation) -> bool {
         match operation {
             Operation::Buffer(_) => {
@@ -1971,7 +1984,7 @@ impl Buffer {
                     },
                 );
                 self.text.lamport_clock.observe(lamport_timestamp);
-                self.selections_update_count += 1;
+                self.non_text_state_update_count += 1;
             }
             Operation::UpdateCompletionTriggers {
                 triggers,
@@ -2003,7 +2016,7 @@ impl Buffer {
                 };
             }
             self.diagnostics_timestamp = lamport_timestamp;
-            self.diagnostics_update_count += 1;
+            self.non_text_state_update_count += 1;
             self.text.lamport_clock.observe(lamport_timestamp);
             cx.notify();
             cx.emit(Event::DiagnosticsUpdated);
@@ -2754,7 +2767,6 @@ impl BufferSnapshot {
             .map(|g| g.outline_config.as_ref().unwrap())
             .collect::<Vec<_>>();
 
-        let mut stack = Vec::<Range<usize>>::new();
         let mut items = Vec::new();
         while let Some(mat) = matches.peek() {
             let config = &configs[mat.grammar_index];
@@ -2772,6 +2784,9 @@ impl BufferSnapshot {
                 continue;
             }
 
+            let mut open_index = None;
+            let mut close_index = None;
+
             let mut buffer_ranges = Vec::new();
             for capture in mat.captures {
                 let node_is_name;
@@ -2783,6 +2798,12 @@ impl BufferSnapshot {
                 {
                     node_is_name = false;
                 } else {
+                    if Some(capture.index) == config.open_capture_ix {
+                        open_index = Some(capture.node.end_byte());
+                    } else if Some(capture.index) == config.close_capture_ix {
+                        close_index = Some(capture.node.start_byte());
+                    }
+
                     continue;
                 }
 
@@ -2855,22 +2876,45 @@ impl BufferSnapshot {
             }
 
             matches.advance();
-            while stack.last().map_or(false, |prev_range| {
-                prev_range.start > item_range.start || prev_range.end < item_range.end
-            }) {
-                stack.pop();
-            }
-            stack.push(item_range.clone());
 
             items.push(OutlineItem {
-                depth: stack.len() - 1,
-                range: self.anchor_after(item_range.start)..self.anchor_before(item_range.end),
+                depth: 0, // We'll calculate the depth later
+                range: item_range,
                 text,
                 highlight_ranges,
                 name_ranges,
-            })
+                body_range: open_index.zip(close_index).map(|(start, end)| start..end),
+            });
         }
-        Some(items)
+
+        items.sort_by_key(|item| (item.range.start, Reverse(item.range.end)));
+
+        // Assign depths based on containment relationships and convert to anchors.
+        let mut item_ends_stack = Vec::<usize>::new();
+        let mut anchor_items = Vec::new();
+        for item in items {
+            while let Some(last_end) = item_ends_stack.last().copied() {
+                if last_end < item.range.end {
+                    item_ends_stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            anchor_items.push(OutlineItem {
+                depth: item_ends_stack.len(),
+                range: self.anchor_after(item.range.start)..self.anchor_before(item.range.end),
+                text: item.text,
+                highlight_ranges: item.highlight_ranges,
+                name_ranges: item.name_ranges,
+                body_range: item.body_range.map(|body_range| {
+                    self.anchor_after(body_range.start)..self.anchor_before(body_range.end)
+                }),
+            });
+            item_ends_stack.push(item.range.end);
+        }
+
+        Some(anchor_items)
     }
 
     /// For each grammar in the language, runs the provided
@@ -3011,6 +3055,43 @@ impl BufferSnapshot {
                 .map(|mat| mat.node.byte_range());
             syntax_matches.advance();
             redacted_range
+        })
+    }
+
+    pub fn injections_intersecting_range<T: ToOffset>(
+        &self,
+        range: Range<T>,
+    ) -> impl Iterator<Item = (Range<usize>, &Arc<Language>)> + '_ {
+        let offset_range = range.start.to_offset(self)..range.end.to_offset(self);
+
+        let mut syntax_matches = self.syntax.matches(offset_range, self, |grammar| {
+            grammar
+                .injection_config
+                .as_ref()
+                .map(|config| &config.query)
+        });
+
+        let configs = syntax_matches
+            .grammars()
+            .iter()
+            .map(|grammar| grammar.injection_config.as_ref())
+            .collect::<Vec<_>>();
+
+        iter::from_fn(move || {
+            let ranges = syntax_matches.peek().and_then(|mat| {
+                let config = &configs[mat.grammar_index]?;
+                let content_capture_range = mat.captures.iter().find_map(|capture| {
+                    if capture.index == config.content_capture_ix {
+                        Some(capture.node.byte_range())
+                    } else {
+                        None
+                    }
+                })?;
+                let language = self.language_at(content_capture_range.start)?;
+                Some((content_capture_range, language))
+            });
+            syntax_matches.advance();
+            ranges
         })
     }
 
@@ -3355,9 +3436,10 @@ impl BufferSnapshot {
 
     /// Returns selections for remote peers intersecting the given range.
     #[allow(clippy::type_complexity)]
-    pub fn remote_selections_in_range(
+    pub fn selections_in_range(
         &self,
         range: Range<Anchor>,
+        include_local: bool,
     ) -> impl Iterator<
         Item = (
             ReplicaId,
@@ -3368,8 +3450,9 @@ impl BufferSnapshot {
     > + '_ {
         self.remote_selections
             .iter()
-            .filter(|(replica_id, set)| {
-                **replica_id != self.text.replica_id() && !set.selections.is_empty()
+            .filter(move |(replica_id, set)| {
+                (include_local || **replica_id != self.text.replica_id())
+                    && !set.selections.is_empty()
             })
             .map(move |(replica_id, set)| {
                 let start_ix = match set.selections.binary_search_by(|probe| {
@@ -3519,19 +3602,10 @@ impl BufferSnapshot {
             .flat_map(move |(_, set)| set.group(group_id, self))
     }
 
-    /// The number of times diagnostics were updated.
-    pub fn diagnostics_update_count(&self) -> usize {
-        self.diagnostics_update_count
-    }
-
-    /// The number of times the buffer was parsed.
-    pub fn parse_count(&self) -> usize {
-        self.parse_count
-    }
-
-    /// The number of times selections were updated.
-    pub fn selections_update_count(&self) -> usize {
-        self.selections_update_count
+    /// An integer version number that accounts for all updates besides
+    /// the buffer's text itself (which is versioned via a version vector).
+    pub fn non_text_state_update_count(&self) -> usize {
+        self.non_text_state_update_count
     }
 
     /// Returns a snapshot of underlying file.
@@ -3550,16 +3624,6 @@ impl BufferSnapshot {
         } else {
             None
         }
-    }
-
-    /// The number of times the underlying file was updated.
-    pub fn file_update_count(&self) -> usize {
-        self.file_update_count
-    }
-
-    /// The number of times the git diff status was updated.
-    pub fn git_diff_update_count(&self) -> usize {
-        self.git_diff_update_count
     }
 }
 
@@ -3592,12 +3656,8 @@ impl Clone for BufferSnapshot {
             file: self.file.clone(),
             remote_selections: self.remote_selections.clone(),
             diagnostics: self.diagnostics.clone(),
-            selections_update_count: self.selections_update_count,
-            diagnostics_update_count: self.diagnostics_update_count,
-            file_update_count: self.file_update_count,
-            git_diff_update_count: self.git_diff_update_count,
             language: self.language.clone(),
-            parse_count: self.parse_count,
+            non_text_state_update_count: self.non_text_state_update_count,
         }
     }
 }
@@ -3824,6 +3884,7 @@ impl Default for Diagnostic {
             is_primary: false,
             is_disk_based: false,
             is_unnecessary: false,
+            data: None,
         }
     }
 }
@@ -3920,7 +3981,7 @@ impl File for TestFile {
         unimplemented!()
     }
 
-    fn to_proto(&self) -> rpc::proto::File {
+    fn to_proto(&self, _: &AppContext) -> rpc::proto::File {
         unimplemented!()
     }
 

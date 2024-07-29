@@ -1,9 +1,10 @@
-use editor::{scroll::Autoscroll, Anchor, AnchorRangeExt, Editor, EditorMode};
+use editor::{
+    actions::ToggleOutline, scroll::Autoscroll, Anchor, AnchorRangeExt, Editor, EditorMode,
+};
 use fuzzy::StringMatch;
 use gpui::{
-    actions, div, rems, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView,
-    HighlightStyle, ParentElement, Point, Render, Styled, Task, View, ViewContext, VisualContext,
-    WeakView, WindowContext,
+    div, rems, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView, ParentElement,
+    Point, Render, Styled, Task, View, ViewContext, VisualContext, WeakView, WindowContext,
 };
 use language::Outline;
 use ordered_float::OrderedFloat;
@@ -13,18 +14,16 @@ use std::{
     sync::Arc,
 };
 
-use theme::{color_alpha, ActiveTheme};
+use theme::ActiveTheme;
 use ui::{prelude::*, ListItem, ListItemSpacing};
 use util::ResultExt;
 use workspace::{DismissDecision, ModalView};
-
-actions!(outline, [Toggle]);
 
 pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(OutlineView::register).detach();
 }
 
-pub fn toggle(editor: View<Editor>, _: &Toggle, cx: &mut WindowContext) {
+pub fn toggle(editor: View<Editor>, _: &ToggleOutline, cx: &mut WindowContext) {
     let outline = editor
         .read(cx)
         .buffer()
@@ -272,10 +271,6 @@ impl PickerDelegate for OutlineViewDelegate {
         let mat = self.matches.get(ix)?;
         let outline_item = self.outline.items.get(mat.candidate_id)?;
 
-        let mut highlight_style = HighlightStyle::default();
-        highlight_style.background_color = Some(color_alpha(cx.theme().colors().text_accent, 0.3));
-        let custom_highlights = mat.ranges().map(|range| (range, highlight_style));
-
         Some(
             ListItem::new(ix)
                 .inset(true)
@@ -285,7 +280,7 @@ impl PickerDelegate for OutlineViewDelegate {
                     div()
                         .text_ui(cx)
                         .pl(rems(outline_item.depth as f32))
-                        .child(language::render_item(outline_item, custom_highlights, cx)),
+                        .child(language::render_item(outline_item, mat.ranges(), cx)),
                 ),
         )
     }
@@ -326,7 +321,7 @@ mod tests {
         let (workspace, cx) = cx.add_window_view(|cx| Workspace::test_new(project.clone(), cx));
         let worktree_id = workspace.update(cx, |workspace, cx| {
             workspace.project().update(cx, |project, cx| {
-                project.worktrees().next().unwrap().read(cx).id()
+                project.worktrees(cx).next().unwrap().read(cx).id()
             })
         });
         let _buffer = project
@@ -423,7 +418,7 @@ mod tests {
         workspace: &View<Workspace>,
         cx: &mut VisualTestContext,
     ) -> View<Picker<OutlineViewDelegate>> {
-        cx.dispatch_action(Toggle);
+        cx.dispatch_action(ToggleOutline);
         workspace.update(cx, |workspace, cx| {
             workspace
                 .active_modal::<OutlineView>(cx)

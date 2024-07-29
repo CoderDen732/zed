@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use futures::{io::BufReader, stream::BoxStream, AsyncBufReadExt, AsyncReadExt, StreamExt};
-use http::{AsyncBody, HttpClient, Method, Request as HttpRequest};
+use futures::{io::BufReader, stream::BoxStream, AsyncBufReadExt, AsyncReadExt, Stream, StreamExt};
+use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use isahc::config::Configurable;
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, time::Duration};
@@ -12,45 +12,61 @@ pub const ANTHROPIC_API_URL: &'static str = "https://api.anthropic.com";
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, EnumIter)]
 pub enum Model {
     #[default]
+    #[serde(alias = "claude-3-5-sonnet", rename = "claude-3-5-sonnet-20240620")]
+    Claude3_5Sonnet,
     #[serde(alias = "claude-3-opus", rename = "claude-3-opus-20240229")]
     Claude3Opus,
     #[serde(alias = "claude-3-sonnet", rename = "claude-3-sonnet-20240229")]
     Claude3Sonnet,
     #[serde(alias = "claude-3-haiku", rename = "claude-3-haiku-20240307")]
     Claude3Haiku,
+    #[serde(rename = "custom")]
+    Custom { name: String, max_tokens: usize },
 }
 
 impl Model {
     pub fn from_id(id: &str) -> Result<Self> {
-        if id.starts_with("claude-3-opus") {
+        if id.starts_with("claude-3-5-sonnet") {
+            Ok(Self::Claude3_5Sonnet)
+        } else if id.starts_with("claude-3-opus") {
             Ok(Self::Claude3Opus)
         } else if id.starts_with("claude-3-sonnet") {
             Ok(Self::Claude3Sonnet)
         } else if id.starts_with("claude-3-haiku") {
             Ok(Self::Claude3Haiku)
         } else {
-            Err(anyhow!("Invalid model id: {}", id))
+            Err(anyhow!("invalid model id"))
         }
     }
 
-    pub fn id(&self) -> &'static str {
+    pub fn id(&self) -> &str {
         match self {
+            Model::Claude3_5Sonnet => "claude-3-5-sonnet-20240620",
             Model::Claude3Opus => "claude-3-opus-20240229",
             Model::Claude3Sonnet => "claude-3-sonnet-20240229",
             Model::Claude3Haiku => "claude-3-opus-20240307",
+            Self::Custom { name, .. } => name,
         }
     }
 
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(&self) -> &str {
         match self {
+            Self::Claude3_5Sonnet => "Claude 3.5 Sonnet",
             Self::Claude3Opus => "Claude 3 Opus",
             Self::Claude3Sonnet => "Claude 3 Sonnet",
             Self::Claude3Haiku => "Claude 3 Haiku",
+            Self::Custom { name, .. } => name,
         }
     }
 
     pub fn max_token_count(&self) -> usize {
-        200_000
+        match self {
+            Self::Claude3_5Sonnet
+            | Self::Claude3Opus
+            | Self::Claude3Sonnet
+            | Self::Claude3Haiku => 200_000,
+            Self::Custom { max_tokens, .. } => *max_tokens,
+        }
     }
 }
 
@@ -82,9 +98,9 @@ impl From<Role> for String {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
-    pub model: Model,
+    pub model: String,
     pub messages: Vec<RequestMessage>,
     pub stream: bool,
     pub system: String,
@@ -97,7 +113,7 @@ pub struct RequestMessage {
     pub content: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseEvent {
     MessageStart {
@@ -122,7 +138,7 @@ pub enum ResponseEvent {
     MessageStop {},
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ResponseMessage {
     #[serde(rename = "type")]
     pub message_type: Option<String>,
@@ -135,19 +151,19 @@ pub struct ResponseMessage {
     pub usage: Option<Usage>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Usage {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text { text: String },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TextDelta {
     TextDelta { text: String },
@@ -208,6 +224,25 @@ pub async fn stream_completion(
             )),
         }
     }
+}
+
+pub fn extract_text_from_events(
+    response: impl Stream<Item = Result<ResponseEvent>>,
+) -> impl Stream<Item = Result<String>> {
+    response.filter_map(|response| async move {
+        match response {
+            Ok(response) => match response {
+                ResponseEvent::ContentBlockStart { content_block, .. } => match content_block {
+                    ContentBlock::Text { text } => Some(Ok(text)),
+                },
+                ResponseEvent::ContentBlockDelta { delta, .. } => match delta {
+                    TextDelta::TextDelta { text } => Some(Ok(text)),
+                },
+                _ => None,
+            },
+            Err(error) => Some(Err(error)),
+        }
+    })
 }
 
 // #[cfg(test)]

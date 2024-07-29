@@ -3,7 +3,7 @@ pub mod cursor_position;
 use cursor_position::LineIndicatorFormat;
 use editor::{scroll::Autoscroll, Editor};
 use gpui::{
-    actions, div, prelude::*, AnyWindowHandle, AppContext, DismissEvent, EventEmitter, FocusHandle,
+    div, prelude::*, AnyWindowHandle, AppContext, DismissEvent, EventEmitter, FocusHandle,
     FocusableView, Render, SharedString, Styled, Subscription, View, ViewContext, VisualContext,
 };
 use settings::Settings;
@@ -12,8 +12,6 @@ use theme::ActiveTheme;
 use ui::{h_flex, prelude::*, v_flex, Label};
 use util::paths::FILE_ROW_COLUMN_DELIMITER;
 use workspace::ModalView;
-
-actions!(go_to_line, [Toggle]);
 
 pub fn init(cx: &mut AppContext) {
     LineIndicatorFormat::register(cx);
@@ -43,7 +41,7 @@ impl GoToLine {
     fn register(editor: &mut Editor, cx: &mut ViewContext<Editor>) {
         let handle = cx.view().downgrade();
         editor
-            .register_action(move |_: &Toggle, cx| {
+            .register_action(move |_: &editor::actions::ToggleGoToLine, cx| {
                 let Some(editor) = handle.upgrade() else {
                     return;
                 };
@@ -260,7 +258,7 @@ mod tests {
         let (workspace, cx) = cx.add_window_view(|cx| Workspace::test_new(project.clone(), cx));
         let worktree_id = workspace.update(cx, |workspace, cx| {
             workspace.project().update(cx, |project, cx| {
-                project.worktrees().next().unwrap().read(cx).id()
+                project.worktrees(cx).next().unwrap().read(cx).id()
             })
         });
         let _buffer = project
@@ -341,7 +339,7 @@ mod tests {
         workspace: &View<Workspace>,
         cx: &mut VisualTestContext,
     ) -> View<GoToLine> {
-        cx.dispatch_action(Toggle);
+        cx.dispatch_action(editor::actions::ToggleGoToLine);
         workspace.update(cx, |workspace, cx| {
             workspace.active_modal::<GoToLine>(cx).unwrap().clone()
         })

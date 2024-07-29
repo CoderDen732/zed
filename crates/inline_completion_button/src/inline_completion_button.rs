@@ -15,13 +15,13 @@ use language::{
 use settings::{update_settings_file, Settings, SettingsStore};
 use std::{path::Path, sync::Arc};
 use supermaven::{AccountStatus, Supermaven};
-use util::{paths, ResultExt};
+use util::ResultExt;
 use workspace::{
     create_and_open_local_file,
     item::ItemHandle,
     notifications::NotificationId,
     ui::{
-        popover_menu, ButtonCommon, Clickable, ContextMenu, IconButton, IconName, IconSize, Tooltip,
+        ButtonCommon, Clickable, ContextMenu, IconButton, IconName, IconSize, PopoverMenu, Tooltip,
     },
     StatusItemView, Toast, Workspace,
 };
@@ -112,7 +112,7 @@ impl Render for InlineCompletionButton {
                 let this = cx.view().clone();
 
                 div().child(
-                    popover_menu("copilot")
+                    PopoverMenu::new("copilot")
                         .menu(move |cx| {
                             Some(match status {
                                 Status::Authorized => {
@@ -161,7 +161,7 @@ impl Render for InlineCompletionButton {
                 let this = cx.view().clone();
 
                 return div().child(
-                    popover_menu("supermaven")
+                    PopoverMenu::new("supermaven")
                         .menu(move |cx| match &status {
                             SupermavenButtonStatus::NeedsActivation(activate_url) => {
                                 Some(ContextMenu::build(cx, |menu, _| {
@@ -286,7 +286,7 @@ impl InlineCompletionButton {
             self.build_language_settings_menu(menu, cx)
                 .separator()
                 .link(
-                    "Copilot Settings",
+                    "Go to Copilot Settings",
                     OpenBrowser {
                         url: COPILOT_SETTINGS_URL.to_string(),
                     }
@@ -298,7 +298,9 @@ impl InlineCompletionButton {
 
     fn build_supermaven_context_menu(&self, cx: &mut ViewContext<Self>) -> View<ContextMenu> {
         ContextMenu::build(cx, |menu, cx| {
-            self.build_language_settings_menu(menu, cx).separator()
+            self.build_language_settings_menu(menu, cx)
+                .separator()
+                .action("Sign Out", supermaven::SignOut.boxed_clone())
         })
     }
 
@@ -369,7 +371,7 @@ async fn configure_disabled_globs(
 ) -> Result<()> {
     let settings_editor = workspace
         .update(&mut cx, |_, cx| {
-            create_and_open_local_file(&paths::SETTINGS, cx, || {
+            create_and_open_local_file(paths::settings_file(), cx, || {
                 settings::initial_user_settings_content().as_ref().into()
             })
         })?
@@ -418,7 +420,7 @@ async fn configure_disabled_globs(
 fn toggle_inline_completions_globally(fs: Arc<dyn Fs>, cx: &mut AppContext) {
     let show_inline_completions =
         all_language_settings(None, cx).inline_completions_enabled(None, None);
-    update_settings_file::<AllLanguageSettings>(fs, cx, move |file| {
+    update_settings_file::<AllLanguageSettings>(fs, cx, move |file, _| {
         file.defaults.show_inline_completions = Some(!show_inline_completions)
     });
 }
@@ -430,7 +432,7 @@ fn toggle_inline_completions_for_language(
 ) {
     let show_inline_completions =
         all_language_settings(None, cx).inline_completions_enabled(Some(&language), None);
-    update_settings_file::<AllLanguageSettings>(fs, cx, move |file| {
+    update_settings_file::<AllLanguageSettings>(fs, cx, move |file, _| {
         file.languages
             .entry(language.name())
             .or_default()
@@ -439,8 +441,10 @@ fn toggle_inline_completions_for_language(
 }
 
 fn hide_copilot(fs: Arc<dyn Fs>, cx: &mut AppContext) {
-    update_settings_file::<AllLanguageSettings>(fs, cx, move |file| {
-        file.features.get_or_insert(Default::default()).copilot = Some(false);
+    update_settings_file::<AllLanguageSettings>(fs, cx, move |file, _| {
+        file.features
+            .get_or_insert(Default::default())
+            .inline_completion_provider = Some(InlineCompletionProvider::None);
     });
 }
 

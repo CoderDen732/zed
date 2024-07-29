@@ -10,8 +10,8 @@ use crate::{
 };
 use futures::StreamExt;
 use gpui::{
-    div, AssetSource, SemanticVersion, TestAppContext, UpdateGlobal, VisualTestContext,
-    WindowBounds, WindowOptions,
+    div, SemanticVersion, TestAppContext, UpdateGlobal, VisualTestContext, WindowBounds,
+    WindowOptions,
 };
 use indoc::indoc;
 use language::{
@@ -21,13 +21,16 @@ use language::{
     BracketPairConfig,
     Capability::ReadWrite,
     FakeLspAdapter, IndentGuide, LanguageConfig, LanguageConfigOverride, LanguageMatcher, Override,
-    Point,
+    ParsedMarkdown, Point,
 };
-use language_settings::IndentGuideSettings;
+use language_settings::{Formatter, FormatterList, IndentGuideSettings};
 use multi_buffer::MultiBufferIndentGuide;
 use parking_lot::Mutex;
-use project::project_settings::{LspSettings, ProjectSettings};
 use project::FakeFs;
+use project::{
+    lsp_command::SIGNATURE_HELP_HIGHLIGHT_CURRENT,
+    project_settings::{LspSettings, ProjectSettings},
+};
 use serde_json::{self, json};
 use std::sync::atomic;
 use std::sync::atomic::AtomicUsize;
@@ -433,6 +436,57 @@ fn test_selection_with_mouse(cx: &mut TestAppContext) {
             .update(cx, |view, cx| view.selections.display_ranges(cx))
             .unwrap(),
         [DisplayPoint::new(DisplayRow(3), 3)..DisplayPoint::new(DisplayRow(0), 0)]
+    );
+}
+
+#[gpui::test]
+fn test_multiple_cursor_removal(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|cx| {
+        let buffer = MultiBuffer::build_simple("aaaaaa\nbbbbbb\ncccccc\nddddddd\n", cx);
+        build_editor(buffer, cx)
+    });
+
+    _ = editor.update(cx, |view, cx| {
+        view.begin_selection(DisplayPoint::new(DisplayRow(2), 1), false, 1, cx);
+    });
+
+    _ = editor.update(cx, |view, cx| {
+        view.end_selection(cx);
+    });
+
+    _ = editor.update(cx, |view, cx| {
+        view.begin_selection(DisplayPoint::new(DisplayRow(3), 2), true, 1, cx);
+    });
+
+    _ = editor.update(cx, |view, cx| {
+        view.end_selection(cx);
+    });
+
+    assert_eq!(
+        editor
+            .update(cx, |view, cx| view.selections.display_ranges(cx))
+            .unwrap(),
+        [
+            DisplayPoint::new(DisplayRow(2), 1)..DisplayPoint::new(DisplayRow(2), 1),
+            DisplayPoint::new(DisplayRow(3), 2)..DisplayPoint::new(DisplayRow(3), 2)
+        ]
+    );
+
+    _ = editor.update(cx, |view, cx| {
+        view.begin_selection(DisplayPoint::new(DisplayRow(2), 1), true, 1, cx);
+    });
+
+    _ = editor.update(cx, |view, cx| {
+        view.end_selection(cx);
+    });
+
+    assert_eq!(
+        editor
+            .update(cx, |view, cx| view.selections.display_ranges(cx))
+            .unwrap(),
+        [DisplayPoint::new(DisplayRow(3), 2)..DisplayPoint::new(DisplayRow(3), 2)]
     );
 }
 
@@ -849,6 +903,175 @@ fn test_fold_action(cx: &mut TestAppContext) {
                     fn c() {⋯
                     }
                 }
+            "
+            .unindent(),
+        );
+
+        view.unfold_lines(&UnfoldLines, cx);
+        assert_eq!(view.display_text(cx), view.buffer.read(cx).read(cx).text());
+    });
+}
+
+#[gpui::test]
+fn test_fold_action_whitespace_sensitive_language(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let view = cx.add_window(|cx| {
+        let buffer = MultiBuffer::build_simple(
+            &"
+                class Foo:
+                    # Hello!
+
+                    def a():
+                        print(1)
+
+                    def b():
+                        print(2)
+
+                    def c():
+                        print(3)
+            "
+            .unindent(),
+            cx,
+        );
+        build_editor(buffer.clone(), cx)
+    });
+
+    _ = view.update(cx, |view, cx| {
+        view.change_selections(None, cx, |s| {
+            s.select_display_ranges([
+                DisplayPoint::new(DisplayRow(7), 0)..DisplayPoint::new(DisplayRow(10), 0)
+            ]);
+        });
+        view.fold(&Fold, cx);
+        assert_eq!(
+            view.display_text(cx),
+            "
+                class Foo:
+                    # Hello!
+
+                    def a():
+                        print(1)
+
+                    def b():⋯
+
+                    def c():⋯
+            "
+            .unindent(),
+        );
+
+        view.fold(&Fold, cx);
+        assert_eq!(
+            view.display_text(cx),
+            "
+                class Foo:⋯
+            "
+            .unindent(),
+        );
+
+        view.unfold_lines(&UnfoldLines, cx);
+        assert_eq!(
+            view.display_text(cx),
+            "
+                class Foo:
+                    # Hello!
+
+                    def a():
+                        print(1)
+
+                    def b():⋯
+
+                    def c():⋯
+            "
+            .unindent(),
+        );
+
+        view.unfold_lines(&UnfoldLines, cx);
+        assert_eq!(view.display_text(cx), view.buffer.read(cx).read(cx).text());
+    });
+}
+
+#[gpui::test]
+fn test_fold_action_multiple_line_breaks(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let view = cx.add_window(|cx| {
+        let buffer = MultiBuffer::build_simple(
+            &"
+                class Foo:
+                    # Hello!
+
+                    def a():
+                        print(1)
+
+                    def b():
+                        print(2)
+
+
+                    def c():
+                        print(3)
+
+
+            "
+            .unindent(),
+            cx,
+        );
+        build_editor(buffer.clone(), cx)
+    });
+
+    _ = view.update(cx, |view, cx| {
+        view.change_selections(None, cx, |s| {
+            s.select_display_ranges([
+                DisplayPoint::new(DisplayRow(7), 0)..DisplayPoint::new(DisplayRow(11), 0)
+            ]);
+        });
+        view.fold(&Fold, cx);
+        assert_eq!(
+            view.display_text(cx),
+            "
+                class Foo:
+                    # Hello!
+
+                    def a():
+                        print(1)
+
+                    def b():⋯
+
+
+                    def c():⋯
+
+
+            "
+            .unindent(),
+        );
+
+        view.fold(&Fold, cx);
+        assert_eq!(
+            view.display_text(cx),
+            "
+                class Foo:⋯
+
+
+            "
+            .unindent(),
+        );
+
+        view.unfold_lines(&UnfoldLines, cx);
+        assert_eq!(
+            view.display_text(cx),
+            "
+                class Foo:
+                    # Hello!
+
+                    def a():
+                        print(1)
+
+                    def b():⋯
+
+
+                    def c():⋯
+
+
             "
             .unindent(),
         );
@@ -4493,12 +4716,13 @@ async fn test_select_larger_smaller_syntax_node(cx: &mut gpui::TestAppContext) {
 
     let buffer = cx.new_model(|cx| Buffer::local(text, cx).with_language(language, cx));
     let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
-    let (view, cx) = cx.add_window_view(|cx| build_editor(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|cx| build_editor(buffer, cx));
 
-    view.condition::<crate::EditorEvent>(&cx, |view, cx| !view.buffer.read(cx).is_parsing(cx))
+    editor
+        .condition::<crate::EditorEvent>(&cx, |view, cx| !view.buffer.read(cx).is_parsing(cx))
         .await;
 
-    _ = view.update(cx, |view, cx| {
+    editor.update(cx, |view, cx| {
         view.change_selections(None, cx, |s| {
             s.select_display_ranges([
                 DisplayPoint::new(DisplayRow(0), 25)..DisplayPoint::new(DisplayRow(0), 25),
@@ -4508,94 +4732,126 @@ async fn test_select_larger_smaller_syntax_node(cx: &mut gpui::TestAppContext) {
         });
         view.select_larger_syntax_node(&SelectLargerSyntaxNode, cx);
     });
-    assert_eq!(
-        view.update(cx, |view, cx| { view.selections.display_ranges(cx) }),
-        &[
-            DisplayPoint::new(DisplayRow(0), 23)..DisplayPoint::new(DisplayRow(0), 27),
-            DisplayPoint::new(DisplayRow(2), 35)..DisplayPoint::new(DisplayRow(2), 7),
-            DisplayPoint::new(DisplayRow(3), 15)..DisplayPoint::new(DisplayRow(3), 21),
-        ]
-    );
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::{mod3, «mod4ˇ»};
 
-    _ = view.update(cx, |view, cx| {
+                fn fn_1«ˇ(param1: bool, param2: &str)» {
+                    let var1 = "«textˇ»";
+                }
+            "#},
+            cx,
+        );
+    });
+
+    editor.update(cx, |view, cx| {
+        view.select_larger_syntax_node(&SelectLargerSyntaxNode, cx);
+    });
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::«{mod3, mod4}ˇ»;
+
+                «ˇfn fn_1(param1: bool, param2: &str) {
+                    let var1 = "text";
+                }»
+            "#},
+            cx,
+        );
+    });
+
+    editor.update(cx, |view, cx| {
         view.select_larger_syntax_node(&SelectLargerSyntaxNode, cx);
     });
     assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
-        &[
-            DisplayPoint::new(DisplayRow(0), 16)..DisplayPoint::new(DisplayRow(0), 28),
-            DisplayPoint::new(DisplayRow(4), 1)..DisplayPoint::new(DisplayRow(2), 0),
-        ]
-    );
-
-    _ = view.update(cx, |view, cx| {
-        view.select_larger_syntax_node(&SelectLargerSyntaxNode, cx);
-    });
-    assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
+        editor.update(cx, |view, cx| view.selections.display_ranges(cx)),
         &[DisplayPoint::new(DisplayRow(5), 0)..DisplayPoint::new(DisplayRow(0), 0)]
     );
 
     // Trying to expand the selected syntax node one more time has no effect.
-    _ = view.update(cx, |view, cx| {
+    editor.update(cx, |view, cx| {
         view.select_larger_syntax_node(&SelectLargerSyntaxNode, cx);
     });
     assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
+        editor.update(cx, |view, cx| view.selections.display_ranges(cx)),
         &[DisplayPoint::new(DisplayRow(5), 0)..DisplayPoint::new(DisplayRow(0), 0)]
     );
 
-    _ = view.update(cx, |view, cx| {
+    editor.update(cx, |view, cx| {
         view.select_smaller_syntax_node(&SelectSmallerSyntaxNode, cx);
     });
-    assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
-        &[
-            DisplayPoint::new(DisplayRow(0), 16)..DisplayPoint::new(DisplayRow(0), 28),
-            DisplayPoint::new(DisplayRow(4), 1)..DisplayPoint::new(DisplayRow(2), 0),
-        ]
-    );
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::«{mod3, mod4}ˇ»;
 
-    _ = view.update(cx, |view, cx| {
-        view.select_smaller_syntax_node(&SelectSmallerSyntaxNode, cx);
+                «ˇfn fn_1(param1: bool, param2: &str) {
+                    let var1 = "text";
+                }»
+            "#},
+            cx,
+        );
     });
-    assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
-        &[
-            DisplayPoint::new(DisplayRow(0), 23)..DisplayPoint::new(DisplayRow(0), 27),
-            DisplayPoint::new(DisplayRow(2), 35)..DisplayPoint::new(DisplayRow(2), 7),
-            DisplayPoint::new(DisplayRow(3), 15)..DisplayPoint::new(DisplayRow(3), 21),
-        ]
-    );
 
-    _ = view.update(cx, |view, cx| {
+    editor.update(cx, |view, cx| {
         view.select_smaller_syntax_node(&SelectSmallerSyntaxNode, cx);
     });
-    assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
-        &[
-            DisplayPoint::new(DisplayRow(0), 25)..DisplayPoint::new(DisplayRow(0), 25),
-            DisplayPoint::new(DisplayRow(2), 24)..DisplayPoint::new(DisplayRow(2), 12),
-            DisplayPoint::new(DisplayRow(3), 18)..DisplayPoint::new(DisplayRow(3), 18),
-        ]
-    );
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::{mod3, «mod4ˇ»};
+
+                fn fn_1«ˇ(param1: bool, param2: &str)» {
+                    let var1 = "«textˇ»";
+                }
+            "#},
+            cx,
+        );
+    });
+
+    editor.update(cx, |view, cx| {
+        view.select_smaller_syntax_node(&SelectSmallerSyntaxNode, cx);
+    });
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::{mod3, mo«ˇ»d4};
+
+                fn fn_1(para«ˇm1: bool, pa»ram2: &str) {
+                    let var1 = "te«ˇ»xt";
+                }
+            "#},
+            cx,
+        );
+    });
 
     // Trying to shrink the selected syntax node one more time has no effect.
-    _ = view.update(cx, |view, cx| {
+    editor.update(cx, |view, cx| {
         view.select_smaller_syntax_node(&SelectSmallerSyntaxNode, cx);
     });
-    assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
-        &[
-            DisplayPoint::new(DisplayRow(0), 25)..DisplayPoint::new(DisplayRow(0), 25),
-            DisplayPoint::new(DisplayRow(2), 24)..DisplayPoint::new(DisplayRow(2), 12),
-            DisplayPoint::new(DisplayRow(3), 18)..DisplayPoint::new(DisplayRow(3), 18),
-        ]
-    );
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::{mod3, mo«ˇ»d4};
+
+                fn fn_1(para«ˇm1: bool, pa»ram2: &str) {
+                    let var1 = "te«ˇ»xt";
+                }
+            "#},
+            cx,
+        );
+    });
 
     // Ensure that we keep expanding the selection if the larger selection starts or ends within
     // a fold.
-    _ = view.update(cx, |view, cx| {
+    editor.update(cx, |view, cx| {
         view.fold_ranges(
             vec![
                 (
@@ -4612,14 +4868,19 @@ async fn test_select_larger_smaller_syntax_node(cx: &mut gpui::TestAppContext) {
         );
         view.select_larger_syntax_node(&SelectLargerSyntaxNode, cx);
     });
-    assert_eq!(
-        view.update(cx, |view, cx| view.selections.display_ranges(cx)),
-        &[
-            DisplayPoint::new(DisplayRow(0), 16)..DisplayPoint::new(DisplayRow(0), 28),
-            DisplayPoint::new(DisplayRow(2), 35)..DisplayPoint::new(DisplayRow(2), 7),
-            DisplayPoint::new(DisplayRow(3), 4)..DisplayPoint::new(DisplayRow(3), 23),
-        ]
-    );
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                use mod1::mod2::«{mod3, mod4}ˇ»;
+
+                fn fn_1«ˇ(param1: bool, param2: &str)» {
+                    «let var1 = "text";ˇ»
+                }
+            "#},
+            cx,
+        );
+    });
 }
 
 #[gpui::test]
@@ -4635,12 +4896,14 @@ async fn test_autoindent_selections(cx: &mut gpui::TestAppContext) {
                             start: "{".to_string(),
                             end: "}".to_string(),
                             close: false,
+                            surround: false,
                             newline: true,
                         },
                         BracketPair {
                             start: "(".to_string(),
                             end: ")".to_string(),
                             close: false,
+                            surround: false,
                             newline: true,
                         },
                     ],
@@ -4684,7 +4947,7 @@ async fn test_autoindent_selections(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_autoclose_pairs(cx: &mut gpui::TestAppContext) {
+async fn test_autoclose_and_auto_surround_pairs(cx: &mut gpui::TestAppContext) {
     init_test(cx, |_| {});
 
     let mut cx = EditorTestContext::new(cx).await;
@@ -4697,31 +4960,43 @@ async fn test_autoclose_pairs(cx: &mut gpui::TestAppContext) {
                         start: "{".to_string(),
                         end: "}".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "(".to_string(),
                         end: ")".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "/*".to_string(),
                         end: " */".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "[".to_string(),
                         end: "]".to_string(),
                         close: false,
+                        surround: false,
                         newline: true,
                     },
                     BracketPair {
                         start: "\"".to_string(),
                         end: "\"".to_string(),
                         close: true,
+                        surround: true,
                         newline: false,
+                    },
+                    BracketPair {
+                        start: "<".to_string(),
+                        end: ">".to_string(),
+                        close: false,
+                        surround: true,
+                        newline: true,
                     },
                 ],
                 ..Default::default()
@@ -4850,6 +5125,16 @@ async fn test_autoclose_pairs(cx: &mut gpui::TestAppContext) {
     cx.assert_editor_state("a\"ˇ\"");
     cx.update_editor(|view, cx| view.handle_input("\"", cx));
     cx.assert_editor_state("a\"\"ˇ");
+
+    // Don't autoclose pair if autoclose is disabled
+    cx.set_state("ˇ");
+    cx.update_editor(|view, cx| view.handle_input("<", cx));
+    cx.assert_editor_state("<ˇ");
+
+    // Surround with brackets if text is selected and auto_surround is enabled, even if autoclose is disabled
+    cx.set_state("«aˇ» b");
+    cx.update_editor(|view, cx| view.handle_input("<", cx));
+    cx.assert_editor_state("<«aˇ»> b");
 }
 
 #[gpui::test]
@@ -4868,18 +5153,21 @@ async fn test_always_treat_brackets_as_autoclosed_skip_over(cx: &mut gpui::TestA
                         start: "{".to_string(),
                         end: "}".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "(".to_string(),
                         end: ")".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "[".to_string(),
                         end: "]".to_string(),
                         close: false,
+                        surround: false,
                         newline: true,
                     },
                 ],
@@ -5293,12 +5581,14 @@ async fn test_surround_with_pair(cx: &mut gpui::TestAppContext) {
                         start: "{".to_string(),
                         end: "}".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "/* ".to_string(),
                         end: "*/".to_string(),
                         close: true,
+                        surround: true,
                         ..Default::default()
                     },
                 ],
@@ -5447,6 +5737,7 @@ async fn test_delete_autoclose_pair(cx: &mut gpui::TestAppContext) {
                     start: "{".to_string(),
                     end: "}".to_string(),
                     close: true,
+                    surround: true,
                     newline: true,
                 }],
                 ..Default::default()
@@ -5558,18 +5849,21 @@ async fn test_always_treat_brackets_as_autoclosed_delete(cx: &mut gpui::TestAppC
                         start: "{".to_string(),
                         end: "}".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "(".to_string(),
                         end: ")".to_string(),
                         close: true,
+                        surround: true,
                         newline: true,
                     },
                     BracketPair {
                         start: "[".to_string(),
                         end: "]".to_string(),
                         close: false,
+                        surround: true,
                         newline: true,
                     },
                 ],
@@ -5861,7 +6155,7 @@ async fn test_document_format_during_save(cx: &mut gpui::TestAppContext) {
         .handle_request::<lsp::request::Formatting, _, _>(move |params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/file.rs").unwrap().into()
+                lsp::Url::from_file_path("/file.rs").unwrap()
             );
             assert_eq!(params.options.tab_size, 4);
             Ok(Some(vec![lsp::TextEdit::new(
@@ -5887,7 +6181,7 @@ async fn test_document_format_during_save(cx: &mut gpui::TestAppContext) {
     fake_server.handle_request::<lsp::request::Formatting, _, _>(move |params, _| async move {
         assert_eq!(
             params.text_document.uri,
-            lsp::Uri::from_file_path("/file.rs").unwrap().into()
+            lsp::Url::from_file_path("/file.rs").unwrap()
         );
         futures::future::pending::<()>().await;
         unreachable!()
@@ -5936,7 +6230,7 @@ async fn test_document_format_during_save(cx: &mut gpui::TestAppContext) {
         .handle_request::<lsp::request::Formatting, _, _>(move |params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/file.rs").unwrap().into()
+                lsp::Url::from_file_path("/file.rs").unwrap()
             );
             assert_eq!(params.options.tab_size, 8);
             Ok(Some(vec![]))
@@ -5997,8 +6291,8 @@ async fn test_multibuffer_format_during_save(cx: &mut gpui::TestAppContext) {
         },
     );
 
-    let worktree = project.update(cx, |project, _| {
-        let mut worktrees = project.worktrees().collect::<Vec<_>>();
+    let worktree = project.update(cx, |project, cx| {
+        let mut worktrees = project.worktrees(cx).collect::<Vec<_>>();
         assert_eq!(worktrees.len(), 1);
         worktrees.pop().unwrap()
     });
@@ -6139,7 +6433,7 @@ async fn test_multibuffer_format_during_save(cx: &mut gpui::TestAppContext) {
         .on_request::<lsp::request::Formatting, _, _>(move |params, _| async move {
             Ok(Some(vec![lsp::TextEdit::new(
                 lsp::Range::new(lsp::Position::new(0, 3), lsp::Position::new(1, 0)),
-                format!("[{} formatted]", params.text_document.uri.as_str()),
+                format!("[{} formatted]", params.text_document.uri),
             )]))
         })
         .detach();
@@ -6213,7 +6507,7 @@ async fn test_range_format_during_save(cx: &mut gpui::TestAppContext) {
         .handle_request::<lsp::request::RangeFormatting, _, _>(move |params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/file.rs").unwrap().into()
+                lsp::Url::from_file_path("/file.rs").unwrap()
             );
             assert_eq!(params.options.tab_size, 4);
             Ok(Some(vec![lsp::TextEdit::new(
@@ -6239,7 +6533,7 @@ async fn test_range_format_during_save(cx: &mut gpui::TestAppContext) {
         move |params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/file.rs").unwrap().into()
+                lsp::Url::from_file_path("/file.rs").unwrap()
             );
             futures::future::pending::<()>().await;
             unreachable!()
@@ -6289,7 +6583,7 @@ async fn test_range_format_during_save(cx: &mut gpui::TestAppContext) {
         .handle_request::<lsp::request::RangeFormatting, _, _>(move |params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/file.rs").unwrap().into()
+                lsp::Url::from_file_path("/file.rs").unwrap()
             );
             assert_eq!(params.options.tab_size, 8);
             Ok(Some(vec![]))
@@ -6303,7 +6597,9 @@ async fn test_range_format_during_save(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 async fn test_document_format_manual_trigger(cx: &mut gpui::TestAppContext) {
     init_test(cx, |settings| {
-        settings.defaults.formatter = Some(language_settings::Formatter::LanguageServer)
+        settings.defaults.formatter = Some(language_settings::SelectedFormatter::List(
+            FormatterList(vec![Formatter::LanguageServer { name: None }].into()),
+        ))
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -6363,7 +6659,7 @@ async fn test_document_format_manual_trigger(cx: &mut gpui::TestAppContext) {
         .handle_request::<lsp::request::Formatting, _, _>(move |params, _| async move {
             assert_eq!(
                 params.text_document.uri,
-                lsp::Uri::from_file_path("/file.rs").unwrap().into()
+                lsp::Url::from_file_path("/file.rs").unwrap()
             );
             assert_eq!(params.options.tab_size, 4);
             Ok(Some(vec![lsp::TextEdit::new(
@@ -6385,7 +6681,7 @@ async fn test_document_format_manual_trigger(cx: &mut gpui::TestAppContext) {
     fake_server.handle_request::<lsp::request::Formatting, _, _>(move |params, _| async move {
         assert_eq!(
             params.text_document.uri,
-            lsp::Uri::from_file_path("/file.rs").unwrap().into()
+            lsp::Url::from_file_path("/file.rs").unwrap()
         );
         futures::future::pending::<()>().await;
         unreachable!()
@@ -6464,7 +6760,7 @@ async fn test_concurrent_format_requests(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 async fn test_strip_whitespace_and_format_via_lsp(cx: &mut gpui::TestAppContext) {
     init_test(cx, |settings| {
-        settings.defaults.formatter = Some(language_settings::Formatter::Auto)
+        settings.defaults.formatter = Some(language_settings::SelectedFormatter::Auto)
     });
 
     let mut cx = EditorLspTestContext::new_rust(
@@ -6576,6 +6872,626 @@ async fn test_strip_whitespace_and_format_via_lsp(cx: &mut gpui::TestAppContext)
         ]
         .join("\n"),
     );
+}
+
+#[gpui::test]
+async fn test_handle_input_for_show_signature_help_auto_signature_help_true(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings::<EditorSettings>(cx, |settings| {
+                settings.auto_signature_help = Some(true);
+            });
+        });
+    });
+
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            signature_help_provider: Some(lsp::SignatureHelpOptions {
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+
+    let language = Language::new(
+        LanguageConfig {
+            name: "Rust".into(),
+            brackets: BracketPairConfig {
+                pairs: vec![
+                    BracketPair {
+                        start: "{".to_string(),
+                        end: "}".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "(".to_string(),
+                        end: ")".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "/*".to_string(),
+                        end: " */".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "[".to_string(),
+                        end: "]".to_string(),
+                        close: false,
+                        surround: false,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "\"".to_string(),
+                        end: "\"".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: false,
+                    },
+                    BracketPair {
+                        start: "<".to_string(),
+                        end: ">".to_string(),
+                        close: false,
+                        surround: true,
+                        newline: true,
+                    },
+                ],
+                ..Default::default()
+            },
+            autoclose_before: "})]".to_string(),
+            ..Default::default()
+        },
+        Some(tree_sitter_rust::language()),
+    );
+    let language = Arc::new(language);
+
+    cx.language_registry().add(language.clone());
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language(Some(language), cx);
+    });
+
+    cx.set_state(
+        &r#"
+            fn main() {
+                sampleˇ
+            }
+        "#
+        .unindent(),
+    );
+
+    cx.update_editor(|view, cx| {
+        view.handle_input("(", cx);
+    });
+    cx.assert_editor_state(
+        &"
+            fn main() {
+                sample(ˇ)
+            }
+        "
+        .unindent(),
+    );
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                    documentation: None,
+                },
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param2: u8".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(0),
+    };
+    handle_signature_help_request(&mut cx, mocked_response).await;
+
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+
+    cx.editor(|editor, _| {
+        let signature_help_state = editor.signature_help_state.popover().cloned();
+        assert!(signature_help_state.is_some());
+        let ParsedMarkdown {
+            text, highlights, ..
+        } = signature_help_state.unwrap().parsed_content;
+        assert_eq!(text, "param1: u8, param2: u8");
+        assert_eq!(highlights, vec![(0..10, SIGNATURE_HELP_HIGHLIGHT_CURRENT)]);
+    });
+}
+
+#[gpui::test]
+async fn test_handle_input_with_different_show_signature_settings(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings::<EditorSettings>(cx, |settings| {
+                settings.auto_signature_help = Some(false);
+                settings.show_signature_help_after_edits = Some(false);
+            });
+        });
+    });
+
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            signature_help_provider: Some(lsp::SignatureHelpOptions {
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+
+    let language = Language::new(
+        LanguageConfig {
+            name: "Rust".into(),
+            brackets: BracketPairConfig {
+                pairs: vec![
+                    BracketPair {
+                        start: "{".to_string(),
+                        end: "}".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "(".to_string(),
+                        end: ")".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "/*".to_string(),
+                        end: " */".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "[".to_string(),
+                        end: "]".to_string(),
+                        close: false,
+                        surround: false,
+                        newline: true,
+                    },
+                    BracketPair {
+                        start: "\"".to_string(),
+                        end: "\"".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: false,
+                    },
+                    BracketPair {
+                        start: "<".to_string(),
+                        end: ">".to_string(),
+                        close: false,
+                        surround: true,
+                        newline: true,
+                    },
+                ],
+                ..Default::default()
+            },
+            autoclose_before: "})]".to_string(),
+            ..Default::default()
+        },
+        Some(tree_sitter_rust::language()),
+    );
+    let language = Arc::new(language);
+
+    cx.language_registry().add(language.clone());
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language(Some(language), cx);
+    });
+
+    // Ensure that signature_help is not called when no signature help is enabled.
+    cx.set_state(
+        &r#"
+            fn main() {
+                sampleˇ
+            }
+        "#
+        .unindent(),
+    );
+    cx.update_editor(|view, cx| {
+        view.handle_input("(", cx);
+    });
+    cx.assert_editor_state(
+        &"
+            fn main() {
+                sample(ˇ)
+            }
+        "
+        .unindent(),
+    );
+    cx.editor(|editor, _| {
+        assert!(editor.signature_help_state.task().is_none());
+    });
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                    documentation: None,
+                },
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param2: u8".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(0),
+    };
+
+    // Ensure that signature_help is called when enabled afte edits
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings::<EditorSettings>(cx, |settings| {
+                settings.auto_signature_help = Some(false);
+                settings.show_signature_help_after_edits = Some(true);
+            });
+        });
+    });
+    cx.set_state(
+        &r#"
+            fn main() {
+                sampleˇ
+            }
+        "#
+        .unindent(),
+    );
+    cx.update_editor(|view, cx| {
+        view.handle_input("(", cx);
+    });
+    cx.assert_editor_state(
+        &"
+            fn main() {
+                sample(ˇ)
+            }
+        "
+        .unindent(),
+    );
+    handle_signature_help_request(&mut cx, mocked_response.clone()).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.update_editor(|editor, _| {
+        let signature_help_state = editor.signature_help_state.popover().cloned();
+        assert!(signature_help_state.is_some());
+        let ParsedMarkdown {
+            text, highlights, ..
+        } = signature_help_state.unwrap().parsed_content;
+        assert_eq!(text, "param1: u8, param2: u8");
+        assert_eq!(highlights, vec![(0..10, SIGNATURE_HELP_HIGHLIGHT_CURRENT)]);
+        editor.signature_help_state = SignatureHelpState::default();
+    });
+
+    // Ensure that signature_help is called when auto signature help override is enabled
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings::<EditorSettings>(cx, |settings| {
+                settings.auto_signature_help = Some(true);
+                settings.show_signature_help_after_edits = Some(false);
+            });
+        });
+    });
+    cx.set_state(
+        &r#"
+            fn main() {
+                sampleˇ
+            }
+        "#
+        .unindent(),
+    );
+    cx.update_editor(|view, cx| {
+        view.handle_input("(", cx);
+    });
+    cx.assert_editor_state(
+        &"
+            fn main() {
+                sample(ˇ)
+            }
+        "
+        .unindent(),
+    );
+    handle_signature_help_request(&mut cx, mocked_response).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.editor(|editor, _| {
+        let signature_help_state = editor.signature_help_state.popover().cloned();
+        assert!(signature_help_state.is_some());
+        let ParsedMarkdown {
+            text, highlights, ..
+        } = signature_help_state.unwrap().parsed_content;
+        assert_eq!(text, "param1: u8, param2: u8");
+        assert_eq!(highlights, vec![(0..10, SIGNATURE_HELP_HIGHLIGHT_CURRENT)]);
+    });
+}
+
+#[gpui::test]
+async fn test_signature_help(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings::<EditorSettings>(cx, |settings| {
+                settings.auto_signature_help = Some(true);
+            });
+        });
+    });
+
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            signature_help_provider: Some(lsp::SignatureHelpOptions {
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+
+    // A test that directly calls `show_signature_help`
+    cx.update_editor(|editor, cx| {
+        editor.show_signature_help(&ShowSignatureHelp, cx);
+    });
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                    documentation: None,
+                },
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param2: u8".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(0),
+    };
+    handle_signature_help_request(&mut cx, mocked_response).await;
+
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+
+    cx.editor(|editor, _| {
+        let signature_help_state = editor.signature_help_state.popover().cloned();
+        assert!(signature_help_state.is_some());
+        let ParsedMarkdown {
+            text, highlights, ..
+        } = signature_help_state.unwrap().parsed_content;
+        assert_eq!(text, "param1: u8, param2: u8");
+        assert_eq!(highlights, vec![(0..10, SIGNATURE_HELP_HIGHLIGHT_CURRENT)]);
+    });
+
+    // When exiting outside from inside the brackets, `signature_help` is closed.
+    cx.set_state(indoc! {"
+        fn main() {
+            sample(ˇ);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+
+    cx.update_editor(|editor, cx| {
+        editor.change_selections(None, cx, |s| s.select_ranges([0..0]));
+    });
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: Vec::new(),
+        active_signature: None,
+        active_parameter: None,
+    };
+    handle_signature_help_request(&mut cx, mocked_response).await;
+
+    cx.condition(|editor, _| !editor.signature_help_state.is_shown())
+        .await;
+
+    cx.editor(|editor, _| {
+        assert!(!editor.signature_help_state.is_shown());
+    });
+
+    // When entering inside the brackets from outside, `show_signature_help` is automatically called.
+    cx.set_state(indoc! {"
+        fn main() {
+            sample(ˇ);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                    documentation: None,
+                },
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param2: u8".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(0),
+    };
+    handle_signature_help_request(&mut cx, mocked_response.clone()).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.editor(|editor, _| {
+        assert!(editor.signature_help_state.is_shown());
+    });
+
+    // Restore the popover with more parameter input
+    cx.set_state(indoc! {"
+        fn main() {
+            sample(param1, param2ˇ);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                    documentation: None,
+                },
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param2: u8".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(1),
+    };
+    handle_signature_help_request(&mut cx, mocked_response.clone()).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+
+    // When selecting a range, the popover is gone.
+    // Avoid using `cx.set_state` to not actually edit the document, just change its selections.
+    cx.update_editor(|editor, cx| {
+        editor.change_selections(None, cx, |s| {
+            s.select_ranges(Some(Point::new(1, 25)..Point::new(1, 19)));
+        })
+    });
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            sample(param1, «ˇparam2»);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+    cx.editor(|editor, _| {
+        assert!(!editor.signature_help_state.is_shown());
+    });
+
+    // When unselecting again, the popover is back if within the brackets.
+    cx.update_editor(|editor, cx| {
+        editor.change_selections(None, cx, |s| {
+            s.select_ranges(Some(Point::new(1, 19)..Point::new(1, 19)));
+        })
+    });
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            sample(param1, ˇparam2);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+    handle_signature_help_request(&mut cx, mocked_response).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.editor(|editor, _| {
+        assert!(editor.signature_help_state.is_shown());
+    });
+
+    // Test to confirm that SignatureHelp does not appear after deselecting multiple ranges when it was hidden by pressing Escape.
+    cx.update_editor(|editor, cx| {
+        editor.change_selections(None, cx, |s| {
+            s.select_ranges(Some(Point::new(0, 0)..Point::new(0, 0)));
+            s.select_ranges(Some(Point::new(1, 19)..Point::new(1, 19)));
+        })
+    });
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            sample(param1, ˇparam2);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+
+    let mocked_response = lsp::SignatureHelp {
+        signatures: vec![lsp::SignatureInformation {
+            label: "fn sample(param1: u8, param2: u8)".to_string(),
+            documentation: None,
+            parameters: Some(vec![
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param1: u8".to_string()),
+                    documentation: None,
+                },
+                lsp::ParameterInformation {
+                    label: lsp::ParameterLabel::Simple("param2: u8".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(1),
+    };
+    handle_signature_help_request(&mut cx, mocked_response.clone()).await;
+    cx.condition(|editor, _| editor.signature_help_state.is_shown())
+        .await;
+    cx.update_editor(|editor, cx| {
+        editor.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
+    });
+    cx.condition(|editor, _| !editor.signature_help_state.is_shown())
+        .await;
+    cx.update_editor(|editor, cx| {
+        editor.change_selections(None, cx, |s| {
+            s.select_ranges(Some(Point::new(1, 25)..Point::new(1, 19)));
+        })
+    });
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            sample(param1, «ˇparam2»);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+    cx.update_editor(|editor, cx| {
+        editor.change_selections(None, cx, |s| {
+            s.select_ranges(Some(Point::new(1, 19)..Point::new(1, 19)));
+        })
+    });
+    cx.assert_editor_state(indoc! {"
+        fn main() {
+            sample(param1, ˇparam2);
+        }
+
+        fn sample(param1: u8, param2: u8) {}
+    "});
+    cx.condition(|editor, _| !editor.signature_help_state.is_shown()) // because hidden by escape
+        .await;
 }
 
 #[gpui::test]
@@ -6764,6 +7680,73 @@ async fn test_completion(cx: &mut gpui::TestAppContext) {
     cx.assert_editor_state("editor.closeˇ");
     handle_resolve_completion_request(&mut cx, None).await;
     apply_additional_edits.await.unwrap();
+}
+
+#[gpui::test]
+async fn test_completion_page_up_down_keys(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            completion_provider: Some(lsp::CompletionOptions {
+                trigger_characters: Some(vec![".".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+    cx.lsp
+        .handle_request::<lsp::request::Completion, _, _>(move |_, _| async move {
+            Ok(Some(lsp::CompletionResponse::Array(vec![
+                lsp::CompletionItem {
+                    label: "first".into(),
+                    ..Default::default()
+                },
+                lsp::CompletionItem {
+                    label: "last".into(),
+                    ..Default::default()
+                },
+            ])))
+        });
+    cx.set_state("variableˇ");
+    cx.simulate_keystroke(".");
+    cx.executor().run_until_parked();
+
+    cx.update_editor(|editor, _| {
+        if let Some(ContextMenu::Completions(menu)) = editor.context_menu.read().as_ref() {
+            assert_eq!(
+                menu.matches.iter().map(|m| &m.string).collect::<Vec<_>>(),
+                &["first", "last"]
+            );
+        } else {
+            panic!("expected completion menu to be open");
+        }
+    });
+
+    cx.update_editor(|editor, cx| {
+        editor.move_page_down(&MovePageDown::default(), cx);
+        if let Some(ContextMenu::Completions(menu)) = editor.context_menu.read().as_ref() {
+            assert!(
+                menu.selected_item == 1,
+                "expected PageDown to select the last item from the context menu"
+            );
+        } else {
+            panic!("expected completion menu to stay open after PageDown");
+        }
+    });
+
+    cx.update_editor(|editor, cx| {
+        editor.move_page_up(&MovePageUp::default(), cx);
+        if let Some(ContextMenu::Completions(menu)) = editor.context_menu.read().as_ref() {
+            assert!(
+                menu.selected_item == 0,
+                "expected PageUp to select the first item from the context menu"
+            );
+        } else {
+            panic!("expected completion menu to stay open after PageUp");
+        }
+    });
 }
 
 #[gpui::test]
@@ -7228,11 +8211,13 @@ async fn test_toggle_block_comment(cx: &mut gpui::TestAppContext) {
     );
     cx.executor().run_until_parked();
     cx.update_editor(|editor, cx| editor.toggle_comments(&ToggleComments::default(), cx));
+    // TODO this is how it actually worked in Zed Stable, which is not very ergonomic.
+    // Uncommenting and commenting from this position brings in even more wrong artifacts.
     cx.assert_editor_state(
         &r#"
             <!-- ˇ<script> -->
                 // ˇvar x = new Y();
-            <!-- ˇ</script> -->
+            // ˇ</script>
         "#
         .unindent(),
     );
@@ -7537,12 +8522,14 @@ async fn test_extra_newline_insertion(cx: &mut gpui::TestAppContext) {
                             start: "{".to_string(),
                             end: "}".to_string(),
                             close: true,
+                            surround: true,
                             newline: true,
                         },
                         BracketPair {
                             start: "/* ".to_string(),
                             end: " */".to_string(),
                             close: true,
+                            surround: true,
                             newline: true,
                         },
                     ],
@@ -7867,7 +8854,6 @@ async fn test_following_with_multiple_excerpts(cx: &mut gpui::TestAppContext) {
     let follower_1 = cx
         .update_window(*workspace.deref(), |_, cx| {
             Editor::from_state_proto(
-                pane.clone(),
                 workspace.root_view(cx).unwrap(),
                 ViewId {
                     creator: Default::default(),
@@ -7959,7 +8945,6 @@ async fn test_following_with_multiple_excerpts(cx: &mut gpui::TestAppContext) {
     let follower_2 = cx
         .update_window(*workspace.deref(), |_, cx| {
             Editor::from_state_proto(
-                pane.clone(),
                 workspace.root_view(cx).unwrap().clone(),
                 ViewId {
                     creator: Default::default(),
@@ -8028,7 +9013,7 @@ async fn go_to_prev_overlapping_diagnostic(
                 .update_diagnostics(
                     LanguageServerId(0),
                     lsp::PublishDiagnosticsParams {
-                        uri: lsp::Uri::from_file_path("/root/file").unwrap().into(),
+                        uri: lsp::Url::from_file_path("/root/file").unwrap(),
                         version: None,
                         diagnostics: vec![
                             lsp::Diagnostic {
@@ -8344,6 +9329,7 @@ async fn test_on_type_formatting_not_triggered(cx: &mut gpui::TestAppContext) {
                     start: "{".to_string(),
                     end: "}".to_string(),
                     close: true,
+                    surround: true,
                     newline: true,
                 }],
                 disabled_scopes_by_bracket_ix: Vec::new(),
@@ -8373,7 +9359,7 @@ async fn test_on_type_formatting_not_triggered(cx: &mut gpui::TestAppContext) {
     let worktree_id = workspace
         .update(cx, |workspace, cx| {
             workspace.project().update(cx, |project, cx| {
-                project.worktrees().next().unwrap().read(cx).id()
+                project.worktrees(cx).next().unwrap().read(cx).id()
             })
         })
         .unwrap();
@@ -8400,7 +9386,7 @@ async fn test_on_type_formatting_not_triggered(cx: &mut gpui::TestAppContext) {
     fake_server.handle_request::<lsp::request::OnTypeFormatting, _, _>(|params, _| async move {
         assert_eq!(
             params.text_document_position.text_document.uri,
-            lsp::Uri::from_file_path("/a/main.rs").unwrap().into(),
+            lsp::Url::from_file_path("/a/main.rs").unwrap(),
         );
         assert_eq!(
             params.text_document_position.position,
@@ -8779,7 +9765,9 @@ async fn test_completions_in_languages_with_extra_word_characters(cx: &mut gpui:
 #[gpui::test]
 async fn test_document_format_with_prettier(cx: &mut gpui::TestAppContext) {
     init_test(cx, |settings| {
-        settings.defaults.formatter = Some(language_settings::Formatter::Prettier)
+        settings.defaults.formatter = Some(language_settings::SelectedFormatter::List(
+            FormatterList(vec![Formatter::Prettier].into()),
+        ))
     });
 
     let fs = FakeFs::new(cx.executor());
@@ -8839,7 +9827,7 @@ async fn test_document_format_with_prettier(cx: &mut gpui::TestAppContext) {
     );
 
     update_test_language_settings(cx, |settings| {
-        settings.defaults.formatter = Some(language_settings::Formatter::Auto)
+        settings.defaults.formatter = Some(language_settings::SelectedFormatter::Auto)
     });
     let format = editor.update(cx, |editor, cx| {
         editor.perform_format(project.clone(), FormatTrigger::Manual, cx)
@@ -9117,7 +10105,7 @@ struct Row8;
 struct Row9;
 struct Row10;"#};
 
-    // Deletion hunks trigger with carets on ajacent rows, so carets and selections have to stay farther to avoid the revert
+    // Deletion hunks trigger with carets on adjacent rows, so carets and selections have to stay farther to avoid the revert
     assert_hunk_revert(
         indoc! {r#"struct Row;
                    struct Row2;
@@ -9501,7 +10489,12 @@ async fn test_mutlibuffer_in_navigation_history(cx: &mut gpui::TestAppContext) {
                 workspace.active_item(cx).is_none(),
                 "active item should be None before the first item is added"
             );
-            workspace.add_item_to_active_pane(Box::new(multi_buffer_editor.clone()), None, cx);
+            workspace.add_item_to_active_pane(
+                Box::new(multi_buffer_editor.clone()),
+                None,
+                true,
+                cx,
+            );
             let active_item = workspace
                 .active_item(cx)
                 .expect("should have an active item after adding the multi buffer");
@@ -11603,6 +12596,7 @@ fn indent_guide(buffer_id: BufferId, start_row: u32, end_row: u32, depth: u32) -
         settings: IndentGuideSettings {
             enabled: true,
             line_width: 1,
+            active_line_width: 1,
             ..Default::default()
         },
     }
@@ -12049,7 +13043,7 @@ async fn test_active_indent_guide_non_matching_indent(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
-fn test_flap_insertion_and_rendering(cx: &mut TestAppContext) {
+fn test_crease_insertion_and_rendering(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|cx| {
@@ -12070,7 +13064,7 @@ fn test_flap_insertion_and_rendering(cx: &mut TestAppContext) {
                 callback: Arc<dyn Fn(bool, &mut WindowContext) + Send + Sync>,
             }
 
-            let flap = Flap::new(
+            let crease = Crease::new(
                 range,
                 FoldPlaceholder::test(),
                 {
@@ -12087,7 +13081,7 @@ fn test_flap_insertion_and_rendering(cx: &mut TestAppContext) {
                 |_row, _folded, _cx| div(),
             );
 
-            editor.insert_flaps(Some(flap), cx);
+            editor.insert_creases(Some(crease), cx);
             let snapshot = editor.snapshot(cx);
             let _div = snapshot.render_fold_toggle(MultiBufferRow(1), false, cx.view().clone(), cx);
             snapshot
@@ -12126,6 +13120,21 @@ fn assert_selection_ranges(marked_text: &str, view: &mut Editor, cx: &mut ViewCo
     );
 }
 
+pub fn handle_signature_help_request(
+    cx: &mut EditorLspTestContext,
+    mocked_response: lsp::SignatureHelp,
+) -> impl Future<Output = ()> {
+    let mut request =
+        cx.handle_request::<lsp::request::SignatureHelpRequest, _, _>(move |_, _, _| {
+            let mocked_response = mocked_response.clone();
+            async move { Ok(Some(mocked_response)) }
+        });
+
+    async move {
+        request.next().await;
+    }
+}
+
 /// Handle completion request passing a marked string specifying where the completion
 /// should be triggered from using '|' character, what range should be replaced, and what completions
 /// should be returned using '<' and '>' to delimit the range
@@ -12151,10 +13160,7 @@ pub fn handle_completion_request(
         let completions = completions.clone();
         counter.fetch_add(1, atomic::Ordering::Release);
         async move {
-            assert_eq!(
-                params.text_document_position.text_document.uri,
-                url.clone().into()
-            );
+            assert_eq!(params.text_document_position.text_document.uri, url.clone());
             assert_eq!(
                 params.text_document_position.position,
                 complete_from_position
@@ -12235,12 +13241,7 @@ pub(crate) fn update_test_project_settings(
 
 pub(crate) fn init_test(cx: &mut TestAppContext, f: fn(&mut AllLanguageSettingsContent)) {
     _ = cx.update(|cx| {
-        cx.text_system()
-            .add_fonts(vec![assets::Assets
-                .load("fonts/zed-mono/zed-mono-extended.ttf")
-                .unwrap()
-                .unwrap()])
-            .unwrap();
+        assets::Assets.load_test_fonts(cx);
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         theme::init(theme::LoadThemes::JustBase, cx);

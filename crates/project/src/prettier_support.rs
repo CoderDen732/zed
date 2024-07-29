@@ -13,13 +13,14 @@ use futures::{
 };
 use gpui::{AsyncAppContext, Model, ModelContext, Task, WeakModel};
 use language::{
-    language_settings::{Formatter, LanguageSettings},
+    language_settings::{Formatter, LanguageSettings, SelectedFormatter},
     Buffer, LanguageServerName, LocalFile,
 };
 use lsp::{LanguageServer, LanguageServerId};
 use node_runtime::NodeRuntime;
+use paths::default_prettier_dir;
 use prettier::Prettier;
-use util::{paths::DEFAULT_PRETTIER_DIR, ResultExt, TryFutureExt};
+use util::{ResultExt, TryFutureExt};
 
 use crate::{
     Event, File, FormatOperation, PathChange, Project, ProjectEntryId, Worktree, WorktreeId,
@@ -29,8 +30,12 @@ pub fn prettier_plugins_for_language(
     language_settings: &LanguageSettings,
 ) -> Option<&HashSet<String>> {
     match &language_settings.formatter {
-        Formatter::Prettier { .. } | Formatter::Auto => Some(&language_settings.prettier.plugins),
-        Formatter::LanguageServer | Formatter::External { .. } | Formatter::CodeActions(_) => None,
+        SelectedFormatter::Auto => Some(&language_settings.prettier.plugins),
+
+        SelectedFormatter::List(list) => list
+            .as_ref()
+            .contains(&Formatter::Prettier)
+            .then_some(&language_settings.prettier.plugins),
     }
 }
 
@@ -251,7 +256,7 @@ fn start_default_prettier(
                 }
                 let new_default_prettier = project.update(&mut cx, |project, cx| {
                     let new_default_prettier =
-                        start_prettier(node, DEFAULT_PRETTIER_DIR.clone(), worktree_id, cx);
+                        start_prettier(node, default_prettier_dir().clone(), worktree_id, cx);
                     project.default_prettier.prettier =
                         PrettierInstallation::Installed(PrettierInstance {
                             attempt: 0,
@@ -266,7 +271,7 @@ fn start_default_prettier(
                 None => {
                     let new_default_prettier = project.update(&mut cx, |project, cx| {
                         let new_default_prettier =
-                            start_prettier(node, DEFAULT_PRETTIER_DIR.clone(), worktree_id, cx);
+                            start_prettier(node, default_prettier_dir().clone(), worktree_id, cx);
                         project.default_prettier.prettier =
                             PrettierInstallation::Installed(PrettierInstance {
                                 attempt: instance.attempt + 1,
@@ -379,7 +384,7 @@ async fn install_prettier_packages(
     .await
     .context("fetching latest npm versions")?;
 
-    let default_prettier_dir = DEFAULT_PRETTIER_DIR.as_path();
+    let default_prettier_dir = default_prettier_dir().as_path();
     match fs.metadata(default_prettier_dir).await.with_context(|| {
         format!("fetching FS metadata for default prettier dir {default_prettier_dir:?}")
     })? {
@@ -405,7 +410,7 @@ async fn install_prettier_packages(
 }
 
 async fn save_prettier_server_file(fs: &dyn Fs) -> anyhow::Result<()> {
-    let prettier_wrapper_path = DEFAULT_PRETTIER_DIR.join(prettier::PRETTIER_SERVER_FILE);
+    let prettier_wrapper_path = default_prettier_dir().join(prettier::PRETTIER_SERVER_FILE);
     fs.save(
         &prettier_wrapper_path,
         &text::Rope::from(prettier::PRETTIER_SERVER_JS),
@@ -422,7 +427,7 @@ async fn save_prettier_server_file(fs: &dyn Fs) -> anyhow::Result<()> {
 }
 
 async fn should_write_prettier_server_file(fs: &dyn Fs) -> bool {
-    let prettier_wrapper_path = DEFAULT_PRETTIER_DIR.join(prettier::PRETTIER_SERVER_FILE);
+    let prettier_wrapper_path = default_prettier_dir().join(prettier::PRETTIER_SERVER_FILE);
     if !fs.is_file(&prettier_wrapper_path).await {
         return true;
     }
@@ -510,7 +515,8 @@ impl Project {
         buffer: &Model<Buffer>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Option<(Option<PathBuf>, PrettierTask)>> {
-        if !self.is_local() {
+        // todo(ssh remote): prettier support
+        if self.is_remote() || self.ssh_session.is_some() {
             return Task::ready(None);
         }
         let buffer = buffer.read(cx);

@@ -4,13 +4,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use assistant_slash_command::{SlashCommand, SlashCommandOutput, SlashCommandOutputSection};
+use assistant_slash_command::{
+    ArgumentCompletion, SlashCommand, SlashCommandOutput, SlashCommandOutputSection,
+};
 use futures::AsyncReadExt;
 use gpui::{AppContext, Task, WeakView};
 use html_to_markdown::{convert_html_to_markdown, markdown, TagHandler};
-use http::{AsyncBody, HttpClient, HttpClientWithUrl};
+use http_client::{AsyncBody, HttpClient, HttpClientWithUrl};
 use language::LspAdapterDelegate;
-use ui::{prelude::*, ButtonLike, ElevationIndex};
+use ui::prelude::*;
 use workspace::Workspace;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -25,7 +27,7 @@ pub(crate) struct FetchSlashCommand;
 impl FetchSlashCommand {
     async fn build_message(http_client: Arc<HttpClientWithUrl>, url: &str) -> Result<String> {
         let mut url = url.to_owned();
-        if !url.starts_with("https://") {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
             url = format!("https://{url}");
         }
 
@@ -62,6 +64,7 @@ impl FetchSlashCommand {
         match content_type {
             ContentType::Html => {
                 let mut handlers: Vec<TagHandler> = vec![
+                    Rc::new(RefCell::new(markdown::WebpageChromeRemover)),
                     Rc::new(RefCell::new(markdown::ParagraphHandler)),
                     Rc::new(RefCell::new(markdown::HeadingHandler)),
                     Rc::new(RefCell::new(markdown::ListHandler)),
@@ -113,12 +116,12 @@ impl SlashCommand for FetchSlashCommand {
     }
 
     fn complete_argument(
-        &self,
+        self: Arc<Self>,
         _query: String,
         _cancel: Arc<AtomicBool>,
         _workspace: Option<WeakView<Workspace>>,
         _cx: &mut AppContext,
-    ) -> Task<Result<Vec<String>>> {
+    ) -> Task<Result<Vec<ArgumentCompletion>>> {
         Task::ready(Ok(Vec::new()))
     }
 
@@ -152,37 +155,11 @@ impl SlashCommand for FetchSlashCommand {
                 text,
                 sections: vec![SlashCommandOutputSection {
                     range,
-                    render_placeholder: Arc::new(move |id, unfold, _cx| {
-                        FetchPlaceholder {
-                            id,
-                            unfold,
-                            url: url.clone(),
-                        }
-                        .into_any_element()
-                    }),
+                    icon: IconName::AtSign,
+                    label: format!("fetch {}", url).into(),
                 }],
                 run_commands_in_text: false,
             })
         })
-    }
-}
-
-#[derive(IntoElement)]
-struct FetchPlaceholder {
-    pub id: ElementId,
-    pub unfold: Arc<dyn Fn(&mut WindowContext)>,
-    pub url: SharedString,
-}
-
-impl RenderOnce for FetchPlaceholder {
-    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
-        let unfold = self.unfold;
-
-        ButtonLike::new(self.id)
-            .style(ButtonStyle::Filled)
-            .layer(ElevationIndex::ElevatedSurface)
-            .child(Icon::new(IconName::AtSign))
-            .child(Label::new(format!("fetch {url}", url = self.url)))
-            .on_click(move |_, cx| unfold(cx))
     }
 }

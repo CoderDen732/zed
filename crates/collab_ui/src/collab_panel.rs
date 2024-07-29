@@ -2,10 +2,7 @@ mod channel_modal;
 mod contact_finder;
 
 use self::channel_modal::ChannelModal;
-use crate::{
-    channel_view::ChannelView, chat_panel::ChatPanel, face_pile::FacePile,
-    CollaborationPanelSettings,
-};
+use crate::{channel_view::ChannelView, chat_panel::ChatPanel, CollaborationPanelSettings};
 use call::ActiveCall;
 use channel::{Channel, ChannelEvent, ChannelStore};
 use client::{ChannelId, Client, Contact, ProjectId, User, UserStore};
@@ -19,7 +16,7 @@ use gpui::{
     EventEmitter, FocusHandle, FocusableView, FontStyle, InteractiveElement, IntoElement,
     ListOffset, ListState, Model, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
     Render, SharedString, Styled, Subscription, Task, TextStyle, View, ViewContext, VisualContext,
-    WeakView, WhiteSpace,
+    WeakView,
 };
 use menu::{Cancel, Confirm, SecondaryConfirm, SelectNext, SelectPrev};
 use project::{Fs, Project};
@@ -34,7 +31,8 @@ use std::{mem, sync::Arc};
 use theme::{ActiveTheme, ThemeSettings};
 use ui::{
     prelude::*, tooltip_container, Avatar, AvatarAvailabilityIndicator, Button, Color, ContextMenu,
-    Icon, IconButton, IconName, IconSize, Indicator, Label, ListHeader, ListItem, Tooltip,
+    Facepile, Icon, IconButton, IconName, IconSize, Indicator, Label, ListHeader, ListItem,
+    Tooltip,
 };
 use util::{maybe, ResultExt, TryFutureExt};
 use workspace::{
@@ -2192,14 +2190,12 @@ impl CollabPanel {
             },
             font_family: settings.ui_font.family.clone(),
             font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
             font_size: rems(0.875).into(),
             font_weight: settings.ui_font.weight,
             font_style: FontStyle::Normal,
             line_height: relative(1.3),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-            white_space: WhiteSpace::Normal,
+            ..Default::default()
         };
 
         EditorElement::new(
@@ -2542,16 +2538,15 @@ impl CollabPanel {
             None
         } else {
             let extra_count = participants.len().saturating_sub(FACEPILE_LIMIT);
-            let result = FacePile::new(
+            let result = Facepile::new(
                 participants
                     .iter()
                     .map(|user| Avatar::new(user.avatar_uri.clone()).into_any_element())
                     .take(FACEPILE_LIMIT)
                     .chain(if extra_count > 0 {
                         Some(
-                            div()
+                            Label::new(format!("+{extra_count}"))
                                 .ml_2()
-                                .child(Label::new(format!("+{extra_count}")))
                                 .into_any_element(),
                         )
                     } else {
@@ -2812,7 +2807,7 @@ impl Panel for CollabPanel {
         settings::update_settings_file::<CollaborationPanelSettings>(
             self.fs.clone(),
             cx,
-            move |settings| settings.dock = Some(position),
+            move |settings, _| settings.dock = Some(position),
         );
     }
 

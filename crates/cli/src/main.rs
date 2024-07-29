@@ -3,10 +3,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{ipc::IpcOneShotServer, CliRequest, CliResponse, IpcHandshake};
+use parking_lot::Mutex;
 use std::{
+    convert::Infallible,
     env, fs, io,
     path::{Path, PathBuf},
     process::ExitStatus,
+    sync::Arc,
     thread::{self, JoinHandle},
 };
 use util::paths::PathLikeWithPosition;
@@ -35,8 +38,7 @@ struct Args {
     ///
     /// Use `path:line:row` syntax to open a file at a specific location.
     /// Non-existing paths and directories will ignore `:line:row` suffix.
-    #[arg(value_parser = parse_path_with_position)]
-    paths_with_position: Vec<PathLikeWithPosition<PathBuf>>,
+    paths_with_position: Vec<String>,
     /// Print Zed's version and the app path.
     #[arg(short, long)]
     version: bool,
@@ -51,12 +53,30 @@ struct Args {
     dev_server_token: Option<String>,
 }
 
-fn parse_path_with_position(
-    argument_str: &str,
-) -> Result<PathLikeWithPosition<PathBuf>, std::convert::Infallible> {
-    PathLikeWithPosition::parse_str(argument_str, |path_str| {
+fn parse_path_with_position(argument_str: &str) -> Result<String, std::io::Error> {
+    let path_like = PathLikeWithPosition::parse_str::<Infallible>(argument_str, |_, path_str| {
         Ok(Path::new(path_str).to_path_buf())
     })
+    .unwrap();
+    let curdir = env::current_dir()?;
+
+    let canonicalized = path_like.map_path_like(|path| match fs::canonicalize(&path) {
+        Ok(path) => Ok(path),
+        Err(e) => {
+            if let Some(mut parent) = path.parent() {
+                if parent == Path::new("") {
+                    parent = &curdir
+                }
+                match fs::canonicalize(parent) {
+                    Ok(parent) => Ok(parent.join(path.file_name().unwrap())),
+                    Err(_) => Err(e),
+                }
+            } else {
+                Err(e)
+            }
+        }
+    })?;
+    Ok(canonicalized.to_string(|path| path.display().to_string()))
 }
 
 fn main() -> Result<()> {
@@ -89,28 +109,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let curdir = env::current_dir()?;
-    let mut paths = vec![];
-    for path in args.paths_with_position {
-        let canonicalized = path.map_path_like(|path| match fs::canonicalize(&path) {
-            Ok(path) => Ok(path),
-            Err(e) => {
-                if let Some(mut parent) = path.parent() {
-                    if parent == Path::new("") {
-                        parent = &curdir;
-                    }
-                    match fs::canonicalize(parent) {
-                        Ok(parent) => Ok(parent.join(path.file_name().unwrap())),
-                        Err(_) => Err(e),
-                    }
-                } else {
-                    Err(e)
-                }
-            }
-        })?;
-        paths.push(canonicalized.to_string(|path| path.display().to_string()))
-    }
-
     let (server, server_name) =
         IpcOneShotServer::<IpcHandshake>::new().context("Handshake before Zed spawn")?;
     let url = format!("zed-cli://{server_name}");
@@ -123,26 +121,49 @@ fn main() -> Result<()> {
         None
     };
 
-    let sender: JoinHandle<anyhow::Result<()>> = thread::spawn(move || {
-        let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
-        let (tx, rx) = (handshake.requests, handshake.responses);
-        tx.send(CliRequest::Open {
-            paths,
-            wait: args.wait,
-            open_new_workspace,
-            dev_server_token: args.dev_server_token,
-        })?;
-
-        while let Ok(response) = rx.recv() {
-            match response {
-                CliResponse::Ping => {}
-                CliResponse::Stdout { message } => println!("{message}"),
-                CliResponse::Stderr { message } => eprintln!("{message}"),
-                CliResponse::Exit { status } => std::process::exit(status),
-            }
+    let exit_status = Arc::new(Mutex::new(None));
+    let mut paths = vec![];
+    let mut urls = vec![];
+    for path in args.paths_with_position.iter() {
+        if path.starts_with("zed://")
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+            || path.starts_with("file://")
+            || path.starts_with("ssh://")
+        {
+            urls.push(path.to_string());
+        } else {
+            paths.push(parse_path_with_position(path)?)
         }
+    }
 
-        Ok(())
+    let sender: JoinHandle<anyhow::Result<()>> = thread::spawn({
+        let exit_status = exit_status.clone();
+        move || {
+            let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
+            let (tx, rx) = (handshake.requests, handshake.responses);
+            tx.send(CliRequest::Open {
+                paths,
+                urls,
+                wait: args.wait,
+                open_new_workspace,
+                dev_server_token: args.dev_server_token,
+            })?;
+
+            while let Ok(response) = rx.recv() {
+                match response {
+                    CliResponse::Ping => {}
+                    CliResponse::Stdout { message } => println!("{message}"),
+                    CliResponse::Stderr { message } => eprintln!("{message}"),
+                    CliResponse::Exit { status } => {
+                        exit_status.lock().replace(status);
+                        return Ok(());
+                    }
+                }
+            }
+
+            Ok(())
+        }
     });
 
     if args.foreground {
@@ -152,6 +173,9 @@ fn main() -> Result<()> {
         sender.join().unwrap()?;
     }
 
+    if let Some(exit_status) = exit_status.lock().take() {
+        std::process::exit(exit_status);
+    }
     Ok(())
 }
 
@@ -172,7 +196,6 @@ mod linux {
     use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
     use fork::Fork;
     use once_cell::sync::Lazy;
-    use util::paths;
 
     use crate::{Detect, InstalledApp};
 
@@ -184,23 +207,24 @@ mod linux {
     impl Detect {
         pub fn detect(path: Option<&Path>) -> anyhow::Result<impl InstalledApp> {
             let path = if let Some(path) = path {
-                path.to_path_buf().canonicalize()
+                path.to_path_buf().canonicalize()?
             } else {
                 let cli = env::current_exe()?;
                 let dir = cli
                     .parent()
-                    .and_then(Path::parent)
                     .ok_or_else(|| anyhow!("no parent path for cli"))?;
 
-                match dir.join("libexec").join("zed-editor").canonicalize() {
-                    Ok(path) => Ok(path),
-                    // In development cli and zed are in the ./target/ directory together
-                    Err(e) => match cli.parent().unwrap().join("zed").canonicalize() {
-                        Ok(path) if path != cli => Ok(path),
-                        _ => Err(e),
-                    },
-                }
-            }?;
+                // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
+                // ./zed is for the target directory in development builds.
+                let possible_locations =
+                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./zed"];
+                possible_locations
+                    .iter()
+                    .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
+                    .ok_or_else(|| {
+                        anyhow!("could not find any of: {}", possible_locations.join(", "))
+                    })?
+            };
 
             Ok(App(path))
         }
@@ -221,7 +245,7 @@ mod linux {
         }
 
         fn launch(&self, ipc_url: String) -> anyhow::Result<()> {
-            let sock_path = paths::SUPPORT_DIR.join(format!("zed-{}.sock", *RELEASE_CHANNEL));
+            let sock_path = paths::support_dir().join(format!("zed-{}.sock", *RELEASE_CHANNEL));
             let sock = UnixDatagram::unbound()?;
             if sock.connect(&sock_path).is_err() {
                 self.boot_background(ipc_url)?;

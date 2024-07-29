@@ -4,16 +4,18 @@ mod toolbar_controls;
 
 #[cfg(test)]
 mod diagnostics_tests;
+pub(crate) mod grouped_diagnostics;
 
 use anyhow::Result;
 use collections::{BTreeSet, HashSet};
 use editor::{
     diagnostic_block_renderer,
-    display_map::{BlockDisposition, BlockId, BlockProperties, BlockStyle, RenderBlock},
+    display_map::{BlockDisposition, BlockProperties, BlockStyle, CustomBlockId, RenderBlock},
     highlight_diagnostic_message,
     scroll::Autoscroll,
     Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer, ToOffset,
 };
+use feature_flags::FeatureFlagAppExt;
 use futures::{
     channel::mpsc::{self, UnboundedSender},
     StreamExt as _,
@@ -43,7 +45,7 @@ use ui::{h_flex, prelude::*, Icon, IconName, Label};
 use util::ResultExt;
 use workspace::{
     item::{BreadcrumbText, Item, ItemEvent, ItemHandle, TabContentParams},
-    ItemNavHistory, Pane, ToolbarItemLocation, Workspace,
+    ItemNavHistory, ToolbarItemLocation, Workspace,
 };
 
 actions!(diagnostics, [Deploy, ToggleWarnings]);
@@ -52,6 +54,9 @@ pub fn init(cx: &mut AppContext) {
     ProjectDiagnosticsSettings::register(cx);
     cx.observe_new_views(ProjectDiagnosticsEditor::register)
         .detach();
+    if !cx.has_flag::<feature_flags::GroupedDiagnostics>() {
+        grouped_diagnostics::init(cx);
+    }
 }
 
 struct ProjectDiagnosticsEditor {
@@ -80,7 +85,7 @@ struct DiagnosticGroupState {
     primary_diagnostic: DiagnosticEntry<language::Anchor>,
     primary_excerpt_ix: usize,
     excerpts: Vec<ExcerptId>,
-    blocks: HashSet<BlockId>,
+    blocks: HashSet<CustomBlockId>,
     block_count: usize,
 }
 
@@ -102,6 +107,9 @@ impl Render for ProjectDiagnosticsEditor {
 
         div()
             .track_focus(&self.focus_handle)
+            .when(self.path_states.is_empty(), |el| {
+                el.key_context("EmptyPane")
+            })
             .size_full()
             .on_action(cx.listener(Self::toggle_warnings))
             .child(child)
@@ -137,7 +145,7 @@ impl ProjectDiagnosticsEditor {
                     this.summary = project.read(cx).diagnostic_summary(false, cx);
                     cx.emit(EditorEvent::TitleChanged);
 
-                    if this.editor.read(cx).is_focused(cx) || this.focus_handle.is_focused(cx) {
+                    if this.editor.focus_handle(cx).contains_focused(cx) || this.focus_handle.contains_focused(cx) {
                         log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. recording change");
                     } else {
                         log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. updating excerpts");
@@ -150,7 +158,7 @@ impl ProjectDiagnosticsEditor {
         let focus_handle = cx.focus_handle();
         cx.on_focus_in(&focus_handle, |this, cx| this.focus_in(cx))
             .detach();
-        cx.on_focus_out(&focus_handle, |this, cx| this.focus_out(cx))
+        cx.on_focus_out(&focus_handle, |this, _event, cx| this.focus_out(cx))
             .detach();
 
         let excerpts = cx.new_model(|cx| {
@@ -229,13 +237,13 @@ impl ProjectDiagnosticsEditor {
 
     fn deploy(workspace: &mut Workspace, _: &Deploy, cx: &mut ViewContext<Workspace>) {
         if let Some(existing) = workspace.item_of_type::<ProjectDiagnosticsEditor>(cx) {
-            workspace.activate_item(&existing, cx);
+            workspace.activate_item(&existing, true, true, cx);
         } else {
             let workspace_handle = cx.view().downgrade();
             let diagnostics = cx.new_view(|cx| {
                 ProjectDiagnosticsEditor::new(workspace.project().clone(), workspace_handle, cx)
             });
-            workspace.add_item_to_active_pane(Box::new(diagnostics), None, cx);
+            workspace.add_item_to_active_pane(Box::new(diagnostics), None, true, cx);
         }
     }
 
@@ -463,7 +471,9 @@ impl ProjectDiagnosticsEditor {
                                         position: (excerpt_id, entry.range.start),
                                         height: diagnostic.message.matches('\n').count() as u8 + 1,
                                         style: BlockStyle::Fixed,
-                                        render: diagnostic_block_renderer(diagnostic, true),
+                                        render: diagnostic_block_renderer(
+                                            diagnostic, None, true, true,
+                                        ),
                                         disposition: BlockDisposition::Below,
                                     });
                                 }
@@ -639,11 +649,7 @@ impl Item for ProjectDiagnosticsEditor {
     fn tab_content(&self, params: TabContentParams, _: &WindowContext) -> AnyElement {
         if self.summary.error_count == 0 && self.summary.warning_count == 0 {
             Label::new("No problems")
-                .color(if params.selected {
-                    Color::Default
-                } else {
-                    Color::Muted
-                })
+                .color(params.text_color())
                 .into_any_element()
         } else {
             h_flex()
@@ -653,13 +659,10 @@ impl Item for ProjectDiagnosticsEditor {
                         h_flex()
                             .gap_1()
                             .child(Icon::new(IconName::XCircle).color(Color::Error))
-                            .child(Label::new(self.summary.error_count.to_string()).color(
-                                if params.selected {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                },
-                            )),
+                            .child(
+                                Label::new(self.summary.error_count.to_string())
+                                    .color(params.text_color()),
+                            ),
                     )
                 })
                 .when(self.summary.warning_count > 0, |then| {
@@ -667,13 +670,10 @@ impl Item for ProjectDiagnosticsEditor {
                         h_flex()
                             .gap_1()
                             .child(Icon::new(IconName::ExclamationTriangle).color(Color::Warning))
-                            .child(Label::new(self.summary.warning_count.to_string()).color(
-                                if params.selected {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                },
-                            )),
+                            .child(
+                                Label::new(self.summary.warning_count.to_string())
+                                    .color(params.text_color()),
+                            ),
                     )
                 })
                 .into_any_element()
@@ -776,26 +776,12 @@ impl Item for ProjectDiagnosticsEditor {
         self.editor
             .update(cx, |editor, cx| editor.added_to_workspace(workspace, cx));
     }
-
-    fn serialized_item_kind() -> Option<&'static str> {
-        Some("diagnostics")
-    }
-
-    fn deserialize(
-        project: Model<Project>,
-        workspace: WeakView<Workspace>,
-        _workspace_id: workspace::WorkspaceId,
-        _item_id: workspace::ItemId,
-        cx: &mut ViewContext<Pane>,
-    ) -> Task<Result<View<Self>>> {
-        Task::ready(Ok(cx.new_view(|cx| Self::new(project, workspace, cx))))
-    }
 }
 
 const DIAGNOSTIC_HEADER: &'static str = "diagnostic header";
 
 fn diagnostic_header_renderer(diagnostic: Diagnostic) -> RenderBlock {
-    let (message, code_ranges) = highlight_diagnostic_message(&diagnostic);
+    let (message, code_ranges) = highlight_diagnostic_message(&diagnostic, None);
     let message: SharedString = message;
     Box::new(move |cx| {
         let highlight_style: HighlightStyle = cx.theme().colors().text_accent.into();

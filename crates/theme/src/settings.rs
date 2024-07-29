@@ -3,8 +3,8 @@ use crate::{Appearance, SyntaxTheme, Theme, ThemeRegistry, ThemeStyleContent};
 use anyhow::Result;
 use derive_more::{Deref, DerefMut};
 use gpui::{
-    px, AppContext, Font, FontFeatures, FontStyle, FontWeight, Global, Pixels, Subscription,
-    ViewContext,
+    px, AppContext, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Global, Pixels,
+    Subscription, ViewContext, WindowContext,
 };
 use refineable::Refineable;
 use schemars::{
@@ -14,7 +14,7 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use settings::{Settings, SettingsJsonSchemaParams, SettingsSources};
+use settings::{add_references_to_properties, Settings, SettingsJsonSchemaParams, SettingsSources};
 use std::sync::Arc;
 use util::ResultExt as _;
 
@@ -94,6 +94,17 @@ pub struct ThemeSettings {
 }
 
 impl ThemeSettings {
+    const DEFAULT_LIGHT_THEME: &'static str = "One Light";
+    const DEFAULT_DARK_THEME: &'static str = "One Dark";
+
+    /// Returns the name of the default theme for the given [`Appearance`].
+    pub fn default_theme(appearance: Appearance) -> &'static str {
+        match appearance {
+            Appearance::Light => Self::DEFAULT_LIGHT_THEME,
+            Appearance::Dark => Self::DEFAULT_DARK_THEME,
+        }
+    }
+
     /// Reloads the current theme.
     ///
     /// Reads the [`ThemeSettings`] to know which theme should be loaded,
@@ -109,10 +120,7 @@ impl ThemeSettings {
             // based on the system appearance.
             let theme_registry = ThemeRegistry::global(cx);
             if theme_registry.get(theme_name).ok().is_none() {
-                theme_name = match *system_appearance {
-                    Appearance::Light => "One Light",
-                    Appearance::Dark => "One Dark",
-                };
+                theme_name = Self::default_theme(*system_appearance);
             };
 
             if let Some(_theme) = theme_settings.switch_theme(theme_name, cx) {
@@ -167,6 +175,11 @@ pub(crate) struct AdjustedBufferFontSize(Pixels);
 
 impl Global for AdjustedBufferFontSize {}
 
+#[derive(Default)]
+pub(crate) struct AdjustedUiFontSize(Pixels);
+
+impl Global for AdjustedUiFontSize {}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ThemeSelection {
@@ -185,7 +198,7 @@ fn theme_name_ref(_: &mut SchemaGenerator) -> Schema {
     Schema::new_ref("#/definitions/ThemeName".into())
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
     /// Use the specified `light` theme.
@@ -213,6 +226,13 @@ impl ThemeSelection {
             },
         }
     }
+
+    pub fn mode(&self) -> Option<ThemeMode> {
+        match self {
+            ThemeSelection::Static(_) => None,
+            ThemeSelection::Dynamic { mode, .. } => Some(*mode),
+        }
+    }
 }
 
 /// Settings for rendering text in UI and text buffers.
@@ -224,6 +244,9 @@ pub struct ThemeSettingsContent {
     /// The name of a font to use for rendering in the UI.
     #[serde(default)]
     pub ui_font_family: Option<String>,
+    /// The font fallbacks to use for rendering in the UI.
+    #[serde(default)]
+    pub ui_font_fallbacks: Option<Vec<String>>,
     /// The OpenType features to enable for text in the UI.
     #[serde(default)]
     pub ui_font_features: Option<FontFeatures>,
@@ -233,6 +256,9 @@ pub struct ThemeSettingsContent {
     /// The name of a font to use for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_family: Option<String>,
+    /// The font fallbacks to use for rendering in text buffers.
+    #[serde(default)]
+    pub buffer_font_fallbacks: Option<Vec<String>>,
     /// The default font size for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_size: Option<f32>,
@@ -260,6 +286,56 @@ pub struct ThemeSettingsContent {
     /// These values will override the ones on the current theme specified in `theme`.
     #[serde(rename = "experimental.theme_overrides", default)]
     pub theme_overrides: Option<ThemeStyleContent>,
+}
+
+impl ThemeSettingsContent {
+    /// Sets the theme for the given appearance to the theme with the specified name.
+    pub fn set_theme(&mut self, theme_name: String, appearance: Appearance) {
+        if let Some(selection) = self.theme.as_mut() {
+            let theme_to_update = match selection {
+                ThemeSelection::Static(theme) => theme,
+                ThemeSelection::Dynamic { mode, light, dark } => match mode {
+                    ThemeMode::Light => light,
+                    ThemeMode::Dark => dark,
+                    ThemeMode::System => match appearance {
+                        Appearance::Light => light,
+                        Appearance::Dark => dark,
+                    },
+                },
+            };
+
+            *theme_to_update = theme_name.to_string();
+        } else {
+            self.theme = Some(ThemeSelection::Static(theme_name.to_string()));
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: ThemeMode) {
+        if let Some(selection) = self.theme.as_mut() {
+            match selection {
+                ThemeSelection::Static(theme) => {
+                    // If the theme was previously set to a single static theme,
+                    // we don't know whether it was a light or dark theme, so we
+                    // just use it for both.
+                    self.theme = Some(ThemeSelection::Dynamic {
+                        mode,
+                        light: theme.clone(),
+                        dark: theme.clone(),
+                    });
+                }
+                ThemeSelection::Dynamic {
+                    mode: mode_to_update,
+                    ..
+                } => *mode_to_update = mode,
+            }
+        } else {
+            self.theme = Some(ThemeSelection::Dynamic {
+                mode,
+                light: ThemeSettings::DEFAULT_LIGHT_THEME.into(),
+                dark: ThemeSettings::DEFAULT_DARK_THEME.into(),
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, JsonSchema, Default)]
@@ -358,7 +434,13 @@ pub fn adjusted_font_size(size: Pixels, cx: &mut AppContext) -> Pixels {
     .max(MIN_FONT_SIZE)
 }
 
-pub fn adjust_font_size(cx: &mut AppContext, f: fn(&mut Pixels)) {
+pub fn get_buffer_font_size(cx: &AppContext) -> Pixels {
+    let buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size;
+    cx.try_global::<AdjustedBufferFontSize>()
+        .map_or(buffer_font_size, |adjusted_size| adjusted_size.0)
+}
+
+pub fn adjust_buffer_font_size(cx: &mut AppContext, f: fn(&mut Pixels)) {
     let buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size;
     let mut adjusted_size = cx
         .try_global::<AdjustedBufferFontSize>()
@@ -370,9 +452,53 @@ pub fn adjust_font_size(cx: &mut AppContext, f: fn(&mut Pixels)) {
     cx.refresh();
 }
 
-pub fn reset_font_size(cx: &mut AppContext) {
+pub fn has_adjusted_buffer_font_size(cx: &mut AppContext) -> bool {
+    cx.has_global::<AdjustedBufferFontSize>()
+}
+
+pub fn reset_buffer_font_size(cx: &mut AppContext) {
     if cx.has_global::<AdjustedBufferFontSize>() {
         cx.remove_global::<AdjustedBufferFontSize>();
+        cx.refresh();
+    }
+}
+
+pub fn setup_ui_font(cx: &mut WindowContext) -> gpui::Font {
+    let (ui_font, ui_font_size) = {
+        let theme_settings = ThemeSettings::get_global(cx);
+        let font = theme_settings.ui_font.clone();
+        (font, get_ui_font_size(cx))
+    };
+
+    cx.set_rem_size(ui_font_size);
+    ui_font
+}
+
+pub fn get_ui_font_size(cx: &WindowContext) -> Pixels {
+    let ui_font_size = ThemeSettings::get_global(cx).ui_font_size;
+    cx.try_global::<AdjustedUiFontSize>()
+        .map_or(ui_font_size, |adjusted_size| adjusted_size.0)
+}
+
+pub fn adjust_ui_font_size(cx: &mut WindowContext, f: fn(&mut Pixels)) {
+    let ui_font_size = ThemeSettings::get_global(cx).ui_font_size;
+    let mut adjusted_size = cx
+        .try_global::<AdjustedUiFontSize>()
+        .map_or(ui_font_size, |adjusted_size| adjusted_size.0);
+
+    f(&mut adjusted_size);
+    adjusted_size = adjusted_size.max(MIN_FONT_SIZE);
+    cx.set_global(AdjustedUiFontSize(adjusted_size));
+    cx.refresh();
+}
+
+pub fn has_adjusted_ui_font_size(cx: &mut AppContext) -> bool {
+    cx.has_global::<AdjustedUiFontSize>()
+}
+
+pub fn reset_ui_font_size(cx: &mut WindowContext) {
+    if cx.has_global::<AdjustedUiFontSize>() {
+        cx.remove_global::<AdjustedUiFontSize>();
         cx.refresh();
     }
 }
@@ -390,14 +516,22 @@ impl settings::Settings for ThemeSettings {
         let mut this = Self {
             ui_font_size: defaults.ui_font_size.unwrap().into(),
             ui_font: Font {
-                family: defaults.ui_font_family.clone().unwrap().into(),
+                family: defaults.ui_font_family.as_ref().unwrap().clone().into(),
                 features: defaults.ui_font_features.clone().unwrap(),
+                fallbacks: defaults
+                    .ui_font_fallbacks
+                    .as_ref()
+                    .map(|fallbacks| FontFallbacks::from_fonts(fallbacks.clone())),
                 weight: defaults.ui_font_weight.map(FontWeight).unwrap(),
                 style: Default::default(),
             },
             buffer_font: Font {
-                family: defaults.buffer_font_family.clone().unwrap().into(),
+                family: defaults.buffer_font_family.as_ref().unwrap().clone().into(),
                 features: defaults.buffer_font_features.clone().unwrap(),
+                fallbacks: defaults
+                    .buffer_font_fallbacks
+                    .as_ref()
+                    .map(|fallbacks| FontFallbacks::from_fonts(fallbacks.clone())),
                 weight: defaults.buffer_font_weight.map(FontWeight).unwrap(),
                 style: FontStyle::default(),
             },
@@ -423,7 +557,9 @@ impl settings::Settings for ThemeSettings {
             if let Some(value) = value.buffer_font_features.clone() {
                 this.buffer_font.features = value;
             }
-
+            if let Some(value) = value.buffer_font_fallbacks.clone() {
+                this.buffer_font.fallbacks = Some(FontFallbacks::from_fonts(value));
+            }
             if let Some(value) = value.buffer_font_weight {
                 this.buffer_font.weight = FontWeight(value);
             }
@@ -433,6 +569,9 @@ impl settings::Settings for ThemeSettings {
             }
             if let Some(value) = value.ui_font_features.clone() {
                 this.ui_font.features = value;
+            }
+            if let Some(value) = value.ui_font_fallbacks.clone() {
+                this.ui_font.fallbacks = Some(FontFallbacks::from_fonts(value));
             }
             if let Some(value) = value.ui_font_weight {
                 this.ui_font.weight = FontWeight(value);
@@ -480,38 +619,21 @@ impl settings::Settings for ThemeSettings {
             ..Default::default()
         };
 
-        let available_fonts = params
-            .font_names
-            .iter()
-            .cloned()
-            .map(Value::String)
-            .collect();
-        let fonts_schema = SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            enum_values: Some(available_fonts),
-            ..Default::default()
-        };
         root_schema.definitions.extend([
             ("ThemeName".into(), theme_name_schema.into()),
-            ("FontFamilies".into(), fonts_schema.into()),
+            ("FontFamilies".into(), params.font_family_schema()),
+            ("FontFallbacks".into(), params.font_fallback_schema()),
         ]);
 
-        root_schema
-            .schema
-            .object
-            .as_mut()
-            .unwrap()
-            .properties
-            .extend([
-                (
-                    "buffer_font_family".to_owned(),
-                    Schema::new_ref("#/definitions/FontFamilies".into()),
-                ),
-                (
-                    "ui_font_family".to_owned(),
-                    Schema::new_ref("#/definitions/FontFamilies".into()),
-                ),
-            ]);
+        add_references_to_properties(
+            &mut root_schema,
+            &[
+                ("buffer_font_family", "#/definitions/FontFamilies"),
+                ("buffer_font_fallbacks", "#/definitions/FontFallbacks"),
+                ("ui_font_family", "#/definitions/FontFamilies"),
+                ("ui_font_fallbacks", "#/definitions/FontFallbacks"),
+            ],
+        );
 
         root_schema
     }

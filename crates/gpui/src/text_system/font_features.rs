@@ -12,6 +12,16 @@ impl FontFeatures {
     pub fn tag_value_list(&self) -> &[(String, u32)] {
         &self.0.as_slice()
     }
+
+    /// Returns whether the `calt` feature is enabled.
+    ///
+    /// Returns `None` if the feature is not present.
+    pub fn is_calt_enabled(&self) -> Option<bool> {
+        self.0
+            .iter()
+            .find(|(feature, _)| feature == "calt")
+            .map(|(_, value)| *value == 1)
+    }
 }
 
 impl std::fmt::Debug for FontFeatures {
@@ -58,7 +68,7 @@ impl<'de> serde::Deserialize<'de> for FontFeatures {
                 while let Some((key, value)) =
                     access.next_entry::<String, Option<FeatureValue>>()?
                 {
-                    if key.len() != 4 && !key.is_ascii() {
+                    if !is_valid_feature_tag(&key) {
                         log::error!("Incorrect font feature tag: {}", key);
                         continue;
                     }
@@ -141,4 +151,8 @@ impl schemars::JsonSchema for FontFeatures {
         }
         schema.into()
     }
+}
+
+fn is_valid_feature_tag(tag: &str) -> bool {
+    tag.len() == 4 && tag.chars().all(|c| c.is_ascii_alphanumeric())
 }

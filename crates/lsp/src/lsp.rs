@@ -3,13 +3,11 @@ mod input_handler;
 pub use lsp_types::request::*;
 pub use lsp_types::*;
 
-pub use lsp_types::Uri as RawUri;
-
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use collections::HashMap;
 use futures::{channel::oneshot, io::BufWriter, select, AsyncRead, AsyncWrite, Future, FutureExt};
 use gpui::{AppContext, AsyncAppContext, BackgroundExecutor, Task};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use postage::{barrier, prelude::Stream};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
@@ -23,13 +21,12 @@ use smol::{
 use smol::process::windows::CommandExt;
 
 use std::{
-    borrow::Cow,
     ffi::OsString,
     fmt,
     io::Write,
+    ops::DerefMut,
     path::PathBuf,
     pin::Pin,
-    str::FromStr,
     sync::{
         atomic::{AtomicI32, Ordering::SeqCst},
         Arc, Weak,
@@ -58,61 +55,6 @@ pub enum IoKind {
     StdErr,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct Uri(lsp_types::Uri);
-
-const FILE_SCHEME: &str = "file://";
-impl Uri {
-    pub fn from_file_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut uri = FILE_SCHEME.to_owned();
-        for part in path.as_ref().components() {
-            let part: Cow<_> = match part {
-                std::path::Component::Prefix(prefix) => prefix.as_os_str().to_string_lossy(),
-                std::path::Component::RootDir => "/".into(),
-                std::path::Component::CurDir => ".".into(),
-                std::path::Component::ParentDir => "..".into(),
-                std::path::Component::Normal(component) => {
-                    let as_str = component.to_string_lossy();
-                    pct_str::PctString::encode(as_str.chars(), pct_str::URIReserved)
-                        .to_string()
-                        .into()
-                }
-            };
-            if !uri.ends_with('/') {
-                uri.push('/');
-            }
-            uri.push_str(&part);
-        }
-        Ok(lsp_types::Uri::from_str(&uri)?.into())
-    }
-    pub fn to_file_path(self) -> Result<PathBuf> {
-        if self
-            .0
-            .scheme()
-            .map_or(true, |scheme| !scheme.eq_lowercase("file"))
-        {
-            bail!("file path does not have a file scheme");
-        }
-        Ok(self.0.path().as_str().into())
-    }
-}
-
-impl PartialEq<lsp_types::Uri> for Uri {
-    fn eq(&self, other: &lsp_types::Uri) -> bool {
-        self.0.eq(other)
-    }
-}
-impl From<lsp_types::Uri> for Uri {
-    fn from(uri: lsp_types::Uri) -> Self {
-        Self(uri)
-    }
-}
-
-impl From<Uri> for lsp_types::Uri {
-    fn from(uri: Uri) -> Self {
-        uri.0
-    }
-}
 /// Represents a launchable language server. This can either be a standalone binary or the path
 /// to a runtime with arguments to instruct it to launch the actual language server file.
 #[derive(Debug, Clone, Deserialize)]
@@ -128,7 +70,7 @@ pub struct LanguageServer {
     next_id: AtomicI32,
     outbound_tx: channel::Sender<String>,
     name: Arc<str>,
-    capabilities: ServerCapabilities,
+    capabilities: RwLock<ServerCapabilities>,
     code_action_kinds: Option<Vec<CodeActionKind>>,
     notification_handlers: Arc<Mutex<HashMap<&'static str, NotificationHandler>>>,
     response_handlers: Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
@@ -265,6 +207,14 @@ impl<F: Future> LspRequestFuture<F::Output> for LspRequest<F> {
     fn id(&self) -> i32 {
         self.id
     }
+}
+
+/// Combined capabilities of the server and the adapter.
+pub struct AdapterServerCapabilities {
+    // Reported capabilities by the server
+    pub server_capabilities: ServerCapabilities,
+    // List of code actions supported by the LspAdapter matching the server
+    pub code_action_kinds: Option<Vec<CodeActionKind>>,
 }
 
 /// Experimental: Informs the end user about the state of the server
@@ -439,7 +389,7 @@ impl LanguageServer {
             notification_handlers,
             response_handlers,
             io_handlers,
-            name: "".into(),
+            name: Arc::default(),
             capabilities: Default::default(),
             code_action_kinds,
             next_id: Default::default(),
@@ -582,12 +532,12 @@ impl LanguageServer {
         options: Option<Value>,
         cx: &AppContext,
     ) -> Task<Result<Arc<Self>>> {
-        let root_uri = Uri::from_file_path(&self.working_dir).unwrap();
+        let root_uri = Url::from_file_path(&self.working_dir).unwrap();
         #[allow(deprecated)]
         let params = InitializeParams {
             process_id: None,
             root_path: None,
-            root_uri: Some(root_uri.clone().into()),
+            root_uri: Some(root_uri.clone()),
             initialization_options: options,
             capabilities: ClientCapabilities {
                 workspace: Some(WorkspaceClientCapabilities {
@@ -699,16 +649,32 @@ impl LanguageServer {
                         ..Default::default()
                     }),
                     formatting: Some(DynamicRegistrationClientCapabilities {
-                        dynamic_registration: None,
+                        dynamic_registration: Some(true),
+                    }),
+                    range_formatting: Some(DynamicRegistrationClientCapabilities {
+                        dynamic_registration: Some(true),
                     }),
                     on_type_formatting: Some(DynamicRegistrationClientCapabilities {
-                        dynamic_registration: None,
+                        dynamic_registration: Some(true),
                     }),
-                    diagnostic: Some(DiagnosticClientCapabilities {
-                        related_document_support: Some(true),
-                        dynamic_registration: None,
+                    signature_help: Some(SignatureHelpClientCapabilities {
+                        signature_information: Some(SignatureInformationSettings {
+                            documentation_format: Some(vec![
+                                MarkupKind::Markdown,
+                                MarkupKind::PlainText,
+                            ]),
+                            parameter_information: Some(ParameterInformationSettings {
+                                label_offset_support: Some(true),
+                            }),
+                            active_parameter_support: Some(true),
+                        }),
+                        ..SignatureHelpClientCapabilities::default()
                     }),
-                    ..Default::default()
+                    synchronization: Some(TextDocumentSyncClientCapabilities {
+                        did_save: Some(true),
+                        ..TextDocumentSyncClientCapabilities::default()
+                    }),
+                    ..TextDocumentClientCapabilities::default()
                 }),
                 experimental: Some(json!({
                     "serverStatusNotification": true,
@@ -718,11 +684,10 @@ impl LanguageServer {
                     ..Default::default()
                 }),
                 general: None,
-                notebook_document: None,
             },
             trace: None,
             workspace_folders: Some(vec![WorkspaceFolder {
-                uri: root_uri.into(),
+                uri: root_uri,
                 name: Default::default(),
             }]),
             client_info: release_channel::ReleaseChannel::try_global(cx).map(|release_channel| {
@@ -740,7 +705,7 @@ impl LanguageServer {
             if let Some(info) = response.server_info {
                 self.name = info.name.into();
             }
-            self.capabilities = response.capabilities;
+            self.capabilities = RwLock::new(response.capabilities);
 
             self.notify::<notification::Initialized>(InitializedParams {})?;
             Ok(Arc::new(self))
@@ -955,8 +920,21 @@ impl LanguageServer {
     }
 
     /// Get the reported capabilities of the running language server.
-    pub fn capabilities(&self) -> &ServerCapabilities {
-        &self.capabilities
+    pub fn capabilities(&self) -> ServerCapabilities {
+        self.capabilities.read().clone()
+    }
+
+    /// Get the reported capabilities of the running language server and
+    /// what we know on the client/adapter-side of its capabilities.
+    pub fn adapter_server_capabilities(&self) -> AdapterServerCapabilities {
+        AdapterServerCapabilities {
+            server_capabilities: self.capabilities(),
+            code_action_kinds: self.code_action_kinds(),
+        }
+    }
+
+    pub fn update_capabilities(&self, update: impl FnOnce(&mut ServerCapabilities)) {
+        update(self.capabilities.write().deref_mut());
     }
 
     /// Get the id of the running language server.
@@ -1063,7 +1041,7 @@ impl LanguageServer {
             select! {
                 response = rx.fuse() => {
                     let elapsed = started.elapsed();
-                    log::info!("Took {elapsed:?} to receive response to {method:?} id {id}");
+                    log::trace!("Took {elapsed:?} to receive response to {method:?} id {id}");
                     cancel_on_drop.abort();
                     response?
                 }
@@ -1355,6 +1333,14 @@ impl FakeLanguageServer {
 
     /// Simulate that the server has started work and notifies about its progress with the specified token.
     pub async fn start_progress(&self, token: impl Into<String>) {
+        self.start_progress_with(token, Default::default()).await
+    }
+
+    pub async fn start_progress_with(
+        &self,
+        token: impl Into<String>,
+        progress: WorkDoneProgressBegin,
+    ) {
         let token = token.into();
         self.request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
             token: NumberOrString::String(token.clone()),
@@ -1363,7 +1349,7 @@ impl FakeLanguageServer {
         .unwrap();
         self.notify::<notification::Progress>(ProgressParams {
             token: NumberOrString::String(token),
-            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(Default::default())),
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(progress)),
         });
     }
 
@@ -1380,6 +1366,7 @@ impl FakeLanguageServer {
 mod tests {
     use super::*;
     use gpui::{SemanticVersion, TestAppContext};
+    use std::str::FromStr;
 
     #[ctor::ctor]
     fn init_logger() {
@@ -1422,7 +1409,7 @@ mod tests {
         server
             .notify::<notification::DidOpenTextDocument>(DidOpenTextDocumentParams {
                 text_document: TextDocumentItem::new(
-                    RawUri::from_str("file://a/b").unwrap(),
+                    Url::from_str("file://a/b").unwrap(),
                     "rust".to_string(),
                     0,
                     "".to_string(),
@@ -1443,7 +1430,7 @@ mod tests {
             message: "ok".to_string(),
         });
         fake.notify::<notification::PublishDiagnostics>(PublishDiagnosticsParams {
-            uri: RawUri::from_str("file://b/c").unwrap(),
+            uri: Url::from_str("file://b/c").unwrap(),
             version: Some(5),
             diagnostics: vec![],
         });

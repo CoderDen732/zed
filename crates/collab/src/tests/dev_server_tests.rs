@@ -66,7 +66,7 @@ async fn test_dev_server(cx: &mut gpui::TestAppContext, cx2: &mut gpui::TestAppC
         .update(cx, |store, cx| {
             let projects = store.dev_server_projects();
             assert_eq!(projects.len(), 1);
-            assert_eq!(projects[0].path, "/remote");
+            assert_eq!(projects[0].paths, vec!["/remote"]);
             workspace::join_dev_server_project(
                 projects[0].id,
                 projects[0].project_id.unwrap(),
@@ -206,7 +206,7 @@ async fn create_dev_server_project(
         .update(cx, |store, cx| {
             let projects = store.dev_server_projects();
             assert_eq!(projects.len(), 1);
-            assert_eq!(projects[0].path, "/remote");
+            assert_eq!(projects[0].paths, vec!["/remote"]);
             workspace::join_dev_server_project(
                 projects[0].id,
                 projects[0].project_id.unwrap(),
@@ -501,6 +501,29 @@ async fn test_dev_server_reconnect(
             )
         })
         .await
+        .unwrap();
+}
+
+#[gpui::test]
+async fn test_dev_server_restart(cx1: &mut gpui::TestAppContext, cx2: &mut gpui::TestAppContext) {
+    let (server, client1) = TestServer::start1(cx1).await;
+
+    let (_dev_server, remote_workspace) =
+        create_dev_server_project(&server, client1.app_state.clone(), cx1, cx2).await;
+    let cx = VisualTestContext::from_window(remote_workspace.into(), cx1).as_mut();
+
+    server.reset().await;
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-p 1 enter");
+    remote_workspace
+        .update(cx, |ws, cx| {
+            ws.active_item_as::<Editor>(cx)
+                .unwrap()
+                .update(cx, |ed, cx| {
+                    assert_eq!(ed.text(cx).to_string(), "remote\nremote\nremote");
+                })
+        })
         .unwrap();
 }
 

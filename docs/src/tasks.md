@@ -19,7 +19,28 @@ Zed supports ways to spawn (and rerun) commands using its integrated terminal to
     // What to do with the terminal pane and tab, after the command was started:
     // * `always` — always show the terminal pane, add and focus the corresponding task's tab in it (default)
     // * `never` — avoid changing current terminal pane focus, but still add/reuse the task's tab there
-    "reveal": "always"
+    "reveal": "always",
+    // What to do with the terminal pane and tab, after the command had finished:
+    // * `never` — Do nothing when the command finishes (default)
+    // * `always` — always hide the terminal tab, hide the pane also if it was the last tab in it
+    // * `on_success` — hide the terminal tab on task success only, otherwise behaves similar to `always`
+    "hide": "never",
+    // Which shell to use when running a task inside the terminal.
+    // May take 3 values:
+    // 1. (default) Use the system's default terminal configuration in /etc/passwd
+    //      "shell": "system"
+    // 2. A program:
+    //      "shell": {
+    //        "program": "sh"
+    //      }
+    // 3. A program with arguments:
+    //     "shell": {
+    //         "with_arguments": {
+    //           "program": "/bin/bash",
+    //           "arguments": ["--login"]
+    //         }
+    //     }
+    "shell": "system"
   }
 ]
 ```
@@ -31,8 +52,9 @@ There are two actions that drive the workflow of using tasks: `task: spawn` and 
 ## Task templates
 
 Tasks can be defined:
-- in global `tasks.json` file; such tasks are available in all Zed projects you work on. You can edit them by using `zed: open tasks` action.
-- in worktree-specific (local) `tasks.json` file; such tasks are available only when working on a project with that worktree included. You can edit worktree-specific tasks by using `zed: open local tasks`.
+
+- in global `tasks.json` file; such tasks are available in all Zed projects you work on. This file is usually located in `~/.config/zed/tasks.json`. You can edit them by using `zed: open tasks` action.
+- in worktree-specific (local) `.zed/tasks.json` file; such tasks are available only when working on a project with that worktree included. You can edit worktree-specific tasks by using `zed: open local tasks`.
 - on the fly with [oneshot tasks](#oneshot-tasks). These tasks are project-specific and do not persist across sections.
 - by language extension.
 

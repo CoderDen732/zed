@@ -3,9 +3,10 @@ mod event_coalescer;
 use crate::{ChannelId, TelemetrySettings};
 use chrono::{DateTime, Utc};
 use clock::SystemClock;
+use collections::{HashMap, HashSet};
 use futures::Future;
 use gpui::{AppContext, BackgroundExecutor, Task};
-use http::{self, HttpClient, HttpClientWithUrl, Method};
+use http_client::{self, HttpClient, HttpClientWithUrl, Method};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use release_channel::ReleaseChannel;
@@ -17,12 +18,13 @@ use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System};
 use telemetry_events::{
     ActionEvent, AppEvent, AssistantEvent, AssistantKind, CallEvent, CpuEvent, EditEvent,
     EditorEvent, Event, EventRequestBody, EventWrapper, ExtensionEvent, InlineCompletionEvent,
-    MemoryEvent, SettingEvent,
+    MemoryEvent, ReplEvent, SettingEvent,
 };
 use tempfile::NamedTempFile;
 #[cfg(not(debug_assertions))]
 use util::ResultExt;
 use util::TryFutureExt;
+use worktree::{UpdatedEntriesSet, WorktreeId};
 
 use self::event_coalescer::EventCoalescer;
 
@@ -47,10 +49,29 @@ struct TelemetryState {
     first_event_date_time: Option<DateTime<Utc>>,
     event_coalescer: EventCoalescer,
     max_queue_size: usize,
+    worktree_id_map: WorktreeIdMap,
 
     os_name: String,
     app_version: String,
     os_version: Option<String>,
+}
+
+#[derive(Debug)]
+struct WorktreeIdMap(HashMap<String, ProjectCache>);
+
+#[derive(Debug)]
+struct ProjectCache {
+    name: String,
+    worktree_ids_reported: HashSet<WorktreeId>,
+}
+
+impl ProjectCache {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            worktree_ids_reported: HashSet::default(),
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -180,6 +201,20 @@ impl Telemetry {
             first_event_date_time: None,
             event_coalescer: EventCoalescer::new(clock.clone()),
             max_queue_size: MAX_QUEUE_LEN,
+            worktree_id_map: WorktreeIdMap(HashMap::from_iter([
+                (
+                    "pnpm-lock.yaml".to_string(),
+                    ProjectCache::new("pnpm".to_string()),
+                ),
+                (
+                    "yarn.lock".to_string(),
+                    ProjectCache::new("yarn".to_string()),
+                ),
+                (
+                    "package.json".to_string(),
+                    ProjectCache::new("node".to_string()),
+                ),
+            ])),
 
             os_version: None,
             os_name: os_name(),
@@ -192,7 +227,7 @@ impl Telemetry {
                 let state = state.clone();
                 async move {
                     if let Some(tempfile) =
-                        NamedTempFile::new_in(util::paths::CONFIG_DIR.as_path()).log_err()
+                        NamedTempFile::new_in(paths::logs_dir().as_path()).log_err()
                     {
                         state.lock().log_file = Some(tempfile);
                     }
@@ -450,6 +485,67 @@ impl Telemetry {
         self.report_event(event)
     }
 
+    pub fn report_discovered_project_events(
+        self: &Arc<Self>,
+        worktree_id: WorktreeId,
+        updated_entries_set: &UpdatedEntriesSet,
+    ) {
+        let project_names: Vec<String> = {
+            let mut state = self.state.lock();
+            state
+                .worktree_id_map
+                .0
+                .iter_mut()
+                .filter_map(|(project_file_name, project_type_telemetry)| {
+                    if project_type_telemetry
+                        .worktree_ids_reported
+                        .contains(&worktree_id)
+                    {
+                        return None;
+                    }
+
+                    let project_file_found = updated_entries_set.iter().any(|(path, _, _)| {
+                        path.as_ref()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name_str| name_str == project_file_name)
+                            .unwrap_or(false)
+                    });
+
+                    if !project_file_found {
+                        return None;
+                    }
+
+                    project_type_telemetry
+                        .worktree_ids_reported
+                        .insert(worktree_id);
+
+                    Some(project_type_telemetry.name.clone())
+                })
+                .collect()
+        };
+
+        // Done on purpose to avoid calling `self.state.lock()` multiple times
+        for project_name in project_names {
+            self.report_app_event(format!("open {} project", project_name));
+        }
+    }
+
+    pub fn report_repl_event(
+        self: &Arc<Self>,
+        kernel_language: String,
+        kernel_status: String,
+        repl_session_id: String,
+    ) {
+        let event = Event::Repl(ReplEvent {
+            kernel_language,
+            kernel_status,
+            repl_session_id,
+        });
+
+        self.report_event(event)
+    }
+
     fn report_event(self: &Arc<Self>, event: Event) {
         let mut state = self.state.lock();
 
@@ -513,10 +609,6 @@ impl Telemetry {
             return;
         }
 
-        if ZED_CLIENT_CHECKSUM_SEED.is_none() {
-            return;
-        };
-
         let this = self.clone();
         self.executor
             .spawn(
@@ -538,6 +630,7 @@ impl Telemetry {
 
                         let request_body = EventRequestBody {
                             installation_id: state.installation_id.as_deref().map(Into::into),
+                            metrics_id: state.metrics_id.as_deref().map(Into::into),
                             session_id: state.session_id.clone(),
                             is_staff: state.is_staff,
                             app_version: state.app_version.clone(),
@@ -552,11 +645,9 @@ impl Telemetry {
                         serde_json::to_writer(&mut json_bytes, &request_body)?;
                     }
 
-                    let Some(checksum) = calculate_json_checksum(&json_bytes) else {
-                        return Ok(());
-                    };
+                    let checksum = calculate_json_checksum(&json_bytes).unwrap_or("".to_string());
 
-                    let request = http::Request::builder()
+                    let request = http_client::Request::builder()
                         .method(Method::POST)
                         .uri(
                             this.http_client
@@ -585,7 +676,7 @@ mod tests {
     use chrono::TimeZone;
     use clock::FakeSystemClock;
     use gpui::TestAppContext;
-    use http::FakeHttpClient;
+    use http_client::FakeHttpClient;
 
     #[gpui::test]
     fn test_telemetry_flush_on_max_queue_size(cx: &mut TestAppContext) {

@@ -18,7 +18,7 @@
 //! [EditorElement]: crate::element::EditorElement
 
 mod block_map;
-mod flap_map;
+mod crease_map;
 mod fold_map;
 mod inlay_map;
 mod tab_map;
@@ -28,12 +28,12 @@ use crate::{
     hover_links::InlayHighlight, movement::TextLayoutDetails, EditorStyle, InlayId, RowExt,
 };
 pub use block_map::{
-    BlockBufferRows, BlockChunks as DisplayChunks, BlockContext, BlockDisposition, BlockId,
-    BlockMap, BlockPoint, BlockProperties, BlockStyle, RenderBlock, TransformBlock,
+    Block, BlockBufferRows, BlockChunks as DisplayChunks, BlockContext, BlockDisposition, BlockId,
+    BlockMap, BlockPoint, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
 };
 use block_map::{BlockRow, BlockSnapshot};
 use collections::{HashMap, HashSet};
-pub use flap_map::*;
+pub use crease_map::*;
 pub use fold_map::{Fold, FoldId, FoldPlaceholder, FoldPoint};
 use fold_map::{FoldMap, FoldSnapshot};
 use gpui::{
@@ -106,9 +106,10 @@ pub struct DisplayMap {
     /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     /// A container for explicitly foldable ranges, which supersede indentation based fold range suggestions.
-    flap_map: FlapMap,
+    crease_map: CreaseMap,
     fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
+    pub(crate) masked: bool,
 }
 
 impl DisplayMap {
@@ -139,7 +140,7 @@ impl DisplayMap {
             excerpt_header_height,
             excerpt_footer_height,
         );
-        let flap_map = FlapMap::default();
+        let crease_map = CreaseMap::default();
 
         cx.observe(&wrap_map, |_, _, cx| cx.notify()).detach();
 
@@ -151,11 +152,12 @@ impl DisplayMap {
             tab_map,
             wrap_map,
             block_map,
-            flap_map,
+            crease_map,
             fold_placeholder,
             text_highlights: Default::default(),
             inlay_highlights: Default::default(),
             clip_at_line_ends: false,
+            masked: false,
         }
     }
 
@@ -169,7 +171,7 @@ impl DisplayMap {
         let (wrap_snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(tab_snapshot.clone(), edits, cx));
-        let block_snapshot = self.block_map.read(wrap_snapshot.clone(), edits);
+        let block_snapshot = self.block_map.read(wrap_snapshot.clone(), edits).snapshot;
 
         DisplaySnapshot {
             buffer_snapshot: self.buffer.read(cx).snapshot(cx),
@@ -178,10 +180,11 @@ impl DisplayMap {
             tab_snapshot,
             wrap_snapshot,
             block_snapshot,
-            flap_snapshot: self.flap_map.snapshot(),
+            crease_snapshot: self.crease_map.snapshot(),
             text_highlights: self.text_highlights.clone(),
             inlay_highlights: self.inlay_highlights.clone(),
             clip_at_line_ends: self.clip_at_line_ends,
+            masked: self.masked,
             fold_placeholder: self.fold_placeholder.clone(),
         }
     }
@@ -247,29 +250,29 @@ impl DisplayMap {
         self.block_map.read(snapshot, edits);
     }
 
-    pub fn insert_flaps(
+    pub fn insert_creases(
         &mut self,
-        flaps: impl IntoIterator<Item = Flap>,
+        creases: impl IntoIterator<Item = Crease>,
         cx: &mut ModelContext<Self>,
-    ) -> Vec<FlapId> {
+    ) -> Vec<CreaseId> {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        self.flap_map.insert(flaps, &snapshot)
+        self.crease_map.insert(creases, &snapshot)
     }
 
-    pub fn remove_flaps(
+    pub fn remove_creases(
         &mut self,
-        flap_ids: impl IntoIterator<Item = FlapId>,
+        crease_ids: impl IntoIterator<Item = CreaseId>,
         cx: &mut ModelContext<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        self.flap_map.remove(flap_ids, &snapshot)
+        self.crease_map.remove(crease_ids, &snapshot)
     }
 
     pub fn insert_blocks(
         &mut self,
         blocks: impl IntoIterator<Item = BlockProperties<Anchor>>,
         cx: &mut ModelContext<Self>,
-    ) -> Vec<BlockId> {
+    ) -> Vec<CustomBlockId> {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
         let tab_size = Self::tab_size(&self.buffer, cx);
@@ -285,7 +288,7 @@ impl DisplayMap {
 
     pub fn replace_blocks(
         &mut self,
-        heights_and_renderers: HashMap<BlockId, (Option<u8>, RenderBlock)>,
+        heights_and_renderers: HashMap<CustomBlockId, (Option<u8>, RenderBlock)>,
         cx: &mut ModelContext<Self>,
     ) {
         //
@@ -306,8 +309,8 @@ impl DisplayMap {
         // directly and the new behavior separately.
         //
         //
-        let mut only_renderers = HashMap::<BlockId, RenderBlock>::default();
-        let mut full_replace = HashMap::<BlockId, (u8, RenderBlock)>::default();
+        let mut only_renderers = HashMap::<CustomBlockId, RenderBlock>::default();
+        let mut full_replace = HashMap::<CustomBlockId, (u8, RenderBlock)>::default();
         for (id, (height, render)) in heights_and_renderers {
             if let Some(height) = height {
                 full_replace.insert(id, (height, render));
@@ -334,7 +337,7 @@ impl DisplayMap {
         block_map.replace(full_replace);
     }
 
-    pub fn remove_blocks(&mut self, ids: HashSet<BlockId>, cx: &mut ModelContext<Self>) {
+    pub fn remove_blocks(&mut self, ids: HashSet<CustomBlockId>, cx: &mut ModelContext<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
         let tab_size = Self::tab_size(&self.buffer, cx);
@@ -346,6 +349,25 @@ impl DisplayMap {
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
         let mut block_map = self.block_map.write(snapshot, edits);
         block_map.remove(ids);
+    }
+
+    pub fn row_for_block(
+        &mut self,
+        block_id: CustomBlockId,
+        cx: &mut ModelContext<Self>,
+    ) -> Option<DisplayRow> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let edits = self.buffer_subscription.consume().into_inner();
+        let tab_size = Self::tab_size(&self.buffer, cx);
+        let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
+        let (snapshot, edits) = self.fold_map.read(snapshot, edits);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let block_map = self.block_map.read(snapshot, edits);
+        let block_row = block_map.row_for_block(block_id)?;
+        Some(DisplayRow(block_row.0))
     }
 
     pub fn highlight_text(
@@ -472,7 +494,7 @@ pub struct HighlightedChunk<'a> {
 pub struct DisplaySnapshot {
     pub buffer_snapshot: MultiBufferSnapshot,
     pub fold_snapshot: FoldSnapshot,
-    pub flap_snapshot: FlapSnapshot,
+    pub crease_snapshot: CreaseSnapshot,
     inlay_snapshot: InlaySnapshot,
     tab_snapshot: TabSnapshot,
     wrap_snapshot: WrapSnapshot,
@@ -480,6 +502,7 @@ pub struct DisplaySnapshot {
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
     clip_at_line_ends: bool,
+    masked: bool,
     pub(crate) fold_placeholder: FoldPlaceholder,
 }
 
@@ -542,7 +565,7 @@ impl DisplaySnapshot {
         }
     }
 
-    // used by line_mode selections and tries to match vim behaviour
+    // used by line_mode selections and tries to match vim behavior
     pub fn expand_to_line(&self, range: Range<Point>) -> Range<Point> {
         let new_start = if range.start.row == 0 {
             MultiBufferPoint::new(0, 0)
@@ -631,6 +654,7 @@ impl DisplaySnapshot {
             .chunks(
                 display_row.0..self.max_point().row().next_row().0,
                 false,
+                self.masked,
                 Highlights::default(),
             )
             .map(|h| h.text)
@@ -638,9 +662,9 @@ impl DisplaySnapshot {
 
     /// Returns text chunks starting at the end of the given display row in reverse until the start of the file
     pub fn reverse_text_chunks(&self, display_row: DisplayRow) -> impl Iterator<Item = &str> {
-        (0..=display_row.0).rev().flat_map(|row| {
+        (0..=display_row.0).rev().flat_map(move |row| {
             self.block_snapshot
-                .chunks(row..row + 1, false, Highlights::default())
+                .chunks(row..row + 1, false, self.masked, Highlights::default())
                 .map(|h| h.text)
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -657,6 +681,7 @@ impl DisplaySnapshot {
         self.block_snapshot.chunks(
             display_rows.start.0..display_rows.end.0,
             language_aware,
+            self.masked,
             Highlights {
                 text_highlights: Some(&self.text_highlights),
                 inlay_highlights: Some(&self.inlay_highlights),
@@ -701,8 +726,7 @@ impl DisplaySnapshot {
             if let Some(severity) = chunk.diagnostic_severity {
                 // Omit underlines for HINT/INFO diagnostics on 'unnecessary' code.
                 if severity <= DiagnosticSeverity::WARNING || !chunk.is_unnecessary {
-                    let diagnostic_color =
-                        super::diagnostic_style(severity, true, &editor_style.status);
+                    let diagnostic_color = super::diagnostic_style(severity, &editor_style.status);
                     diagnostic_highlight.underline = Some(UnderlineStyle {
                         color: Some(diagnostic_color),
                         thickness: 1.0.into(),
@@ -867,10 +891,14 @@ impl DisplaySnapshot {
     pub fn blocks_in_range(
         &self,
         rows: Range<DisplayRow>,
-    ) -> impl Iterator<Item = (DisplayRow, &TransformBlock)> {
+    ) -> impl Iterator<Item = (DisplayRow, &Block)> {
         self.block_snapshot
             .blocks_in_range(rows.start.0..rows.end.0)
             .map(|(row, block)| (DisplayRow(row), block))
+    }
+
+    pub fn block_for_id(&self, id: BlockId) -> Option<Block> {
+        self.block_snapshot.block_for_id(id)
     }
 
     pub fn intersects_fold<T: ToOffset>(&self, offset: T) -> bool {
@@ -938,16 +966,18 @@ impl DisplaySnapshot {
             return false;
         }
 
-        for next_row in (buffer_row.0 + 1)..=max_row.0 {
-            let next_line_indent = self.line_indent_for_buffer_row(MultiBufferRow(next_row));
-            if next_line_indent.raw_len() > line_indent.raw_len() {
-                return true;
-            } else if !next_line_indent.is_line_blank() {
-                break;
-            }
-        }
-
-        false
+        (buffer_row.0 + 1..=max_row.0)
+            .find_map(|next_row| {
+                let next_line_indent = self.line_indent_for_buffer_row(MultiBufferRow(next_row));
+                if next_line_indent.raw_len() > line_indent.raw_len() {
+                    Some(true)
+                } else if !next_line_indent.is_line_blank() {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false)
     }
 
     pub fn foldable_range(
@@ -955,13 +985,13 @@ impl DisplaySnapshot {
         buffer_row: MultiBufferRow,
     ) -> Option<(Range<Point>, FoldPlaceholder)> {
         let start = MultiBufferPoint::new(buffer_row.0, self.buffer_snapshot.line_len(buffer_row));
-        if let Some(flap) = self
-            .flap_snapshot
+        if let Some(crease) = self
+            .crease_snapshot
             .query_row(buffer_row, &self.buffer_snapshot)
         {
             Some((
-                flap.range.to_point(&self.buffer_snapshot),
-                flap.placeholder.clone(),
+                crease.range.to_point(&self.buffer_snapshot),
+                crease.placeholder.clone(),
             ))
         } else if self.starts_indent(MultiBufferRow(start.row))
             && !self.is_line_folded(MultiBufferRow(start.row))
@@ -983,8 +1013,23 @@ impl DisplaySnapshot {
                     break;
                 }
             }
-            let end = end.unwrap_or(max_point);
-            Some((start..end, self.fold_placeholder.clone()))
+
+            let mut row_before_line_breaks = end.unwrap_or(max_point);
+            while row_before_line_breaks.row > start.row
+                && self
+                    .buffer_snapshot
+                    .is_line_blank(MultiBufferRow(row_before_line_breaks.row))
+            {
+                row_before_line_breaks.row -= 1;
+            }
+
+            row_before_line_breaks = Point::new(
+                row_before_line_breaks.row,
+                self.buffer_snapshot
+                    .line_len(MultiBufferRow(row_before_line_breaks.row)),
+            );
+
+            Some((start..row_before_line_breaks, self.fold_placeholder.clone()))
         } else {
             None
         }
@@ -1018,6 +1063,22 @@ impl Debug for DisplayPoint {
             self.row().0,
             self.column()
         ))
+    }
+}
+
+impl Add for DisplayPoint {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        DisplayPoint(BlockPoint(self.0 .0 + other.0 .0))
+    }
+}
+
+impl Sub for DisplayPoint {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self::Output {
+        DisplayPoint(BlockPoint(self.0 .0 - other.0 .0))
     }
 }
 
@@ -1930,7 +1991,7 @@ pub mod tests {
     }
 
     #[gpui::test]
-    fn test_flaps(cx: &mut gpui::AppContext) {
+    fn test_creases(cx: &mut gpui::AppContext) {
         init_test(cx, |_| {});
 
         let text = "aaa\nbbb\nccc\nddd\neee\nfff\nggg\nhhh\niii\njjj\nkkk\nlll";
@@ -1953,8 +2014,8 @@ pub mod tests {
             let range =
                 snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(3, 3));
 
-            map.flap_map.insert(
-                [Flap::new(
+            map.crease_map.insert(
+                [Crease::new(
                     range,
                     FoldPlaceholder::test(),
                     |_row, _status, _toggle, _cx| div(),

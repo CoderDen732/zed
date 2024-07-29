@@ -5,18 +5,19 @@ use crate::{
     },
     toolbar::Toolbar,
     workspace_settings::{AutosaveSetting, TabBarSettings, WorkspaceSettings},
-    CloseWindow, NewCenterTerminal, NewFile, NewSearch, OpenInTerminal, OpenTerminal, OpenVisible,
-    SplitDirection, ToggleZoom, Workspace,
+    CloseWindow, CopyPath, CopyRelativePath, NewFile, NewTerminal, OpenInTerminal, OpenTerminal,
+    OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace,
 };
 use anyhow::Result;
 use collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gpui::{
     actions, anchored, deferred, impl_actions, prelude::*, Action, AnchorCorner, AnyElement,
-    AppContext, AsyncWindowContext, ClickEvent, DismissEvent, Div, DragMoveEvent, EntityId,
-    EventEmitter, ExternalPaths, FocusHandle, FocusableView, KeyContext, Model, MouseButton,
-    MouseDownEvent, NavigationDirection, Pixels, Point, PromptLevel, Render, ScrollHandle,
-    Subscription, Task, View, ViewContext, VisualContext, WeakFocusHandle, WeakView, WindowContext,
+    AppContext, AsyncWindowContext, ClickEvent, ClipboardItem, DismissEvent, Div, DragMoveEvent,
+    EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent, FocusableView, KeyContext,
+    Model, MouseButton, MouseDownEvent, NavigationDirection, Pixels, Point, PromptLevel, Render,
+    ScrollHandle, Subscription, Task, View, ViewContext, VisualContext, WeakFocusHandle, WeakView,
+    WindowContext,
 };
 use itertools::Itertools;
 use parking_lot::Mutex;
@@ -365,8 +366,24 @@ impl Pane {
                             .on_click(cx.listener(|pane, _, cx| {
                                 let menu = ContextMenu::build(cx, |menu, _| {
                                     menu.action("New File", NewFile.boxed_clone())
-                                        .action("New Terminal", NewCenterTerminal.boxed_clone())
-                                        .action("New Search", NewSearch.boxed_clone())
+                                        .action(
+                                            "Open File",
+                                            ToggleFileFinder::default().boxed_clone(),
+                                        )
+                                        .separator()
+                                        .action(
+                                            "Search Project",
+                                            DeploySearch {
+                                                replace_enabled: false,
+                                            }
+                                            .boxed_clone(),
+                                        )
+                                        .action(
+                                            "Search Symbols",
+                                            ToggleProjectSymbols.boxed_clone(),
+                                        )
+                                        .separator()
+                                        .action("New Terminal", NewTerminal.boxed_clone())
                                 });
                                 cx.subscribe(&menu, |pane, _, _: &DismissEvent, cx| {
                                     pane.focus(cx);
@@ -517,7 +534,7 @@ impl Pane {
             .map_or(false, |menu| menu.focus_handle(cx).is_focused(cx))
     }
 
-    fn focus_out(&mut self, cx: &mut ViewContext<Self>) {
+    fn focus_out(&mut self, _event: FocusOutEvent, cx: &mut ViewContext<Self>) {
         self.was_focused = false;
         self.toolbar.update(cx, |toolbar, cx| {
             toolbar.focus_changed(false, cx);
@@ -1404,7 +1421,7 @@ impl Pane {
             if save_intent == SaveIntent::Close {
                 let will_autosave = cx.update(|cx| {
                     matches!(
-                        WorkspaceSettings::get_global(cx).autosave,
+                        item.workspace_settings(cx).autosave,
                         AutosaveSetting::OnFocusChange | AutosaveSetting::OnWindowChange
                     ) && Self::can_autosave_item(item, cx)
                 })?;
@@ -1460,6 +1477,7 @@ impl Pane {
                 }
             }
         }
+
         Ok(true)
     }
 
@@ -1473,13 +1491,12 @@ impl Pane {
         project: Model<Project>,
         cx: &mut WindowContext,
     ) -> Task<Result<()>> {
-        let format = if let AutosaveSetting::AfterDelay { .. } =
-            WorkspaceSettings::get_global(cx).autosave
-        {
-            false
-        } else {
-            true
-        };
+        let format =
+            if let AutosaveSetting::AfterDelay { .. } = item.workspace_settings(cx).autosave {
+                false
+            } else {
+                true
+            };
         if Self::can_autosave_item(item, cx) {
             item.save(format, project, cx)
         } else {
@@ -1551,10 +1568,39 @@ impl Pane {
         });
     }
 
+    fn entry_abs_path(&self, entry: ProjectEntryId, cx: &WindowContext) -> Option<PathBuf> {
+        let worktree = self
+            .workspace
+            .upgrade()?
+            .read(cx)
+            .project()
+            .read(cx)
+            .worktree_for_entry(entry, cx)?
+            .read(cx);
+        let entry = worktree.entry_for_id(entry)?;
+        let abs_path = worktree.absolutize(&entry.path).ok()?;
+        if entry.is_symlink {
+            abs_path.canonicalize().ok()
+        } else {
+            Some(abs_path)
+        }
+    }
+
+    fn copy_relative_path(&mut self, _: &CopyRelativePath, cx: &mut ViewContext<Self>) {
+        if let Some(clipboard_text) = self
+            .active_item()
+            .as_ref()
+            .and_then(|entry| entry.project_path(cx))
+            .map(|p| p.path.to_string_lossy().to_string())
+        {
+            cx.write_to_clipboard(ClipboardItem::new(clipboard_text));
+        }
+    }
+
     fn render_tab(
         &self,
         ix: usize,
-        item: &Box<dyn ItemHandle>,
+        item: &dyn ItemHandle,
         detail: usize,
         cx: &mut ViewContext<'_, Pane>,
     ) -> impl IntoElement {
@@ -1572,6 +1618,7 @@ impl Pane {
             },
             cx,
         );
+        let icon = item.tab_icon(cx);
         let close_side = &ItemSettings::get_global(cx).close_position;
         let indicator = render_item_indicator(item.boxed_clone(), cx);
         let item_id = item.item_id();
@@ -1659,7 +1706,18 @@ impl Pane {
                             .detach_and_log_err(cx);
                     })),
             )
-            .child(label);
+            .child(
+                h_flex()
+                    .gap_1()
+                    .children(icon.map(|icon| {
+                        icon.size(IconSize::Small).color(if is_active {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
+                    }))
+                    .child(label),
+            );
 
         let single_entry_to_resolve = {
             let item_entries = self.items[ix].project_entry_ids(cx);
@@ -1732,30 +1790,32 @@ impl Pane {
                         );
 
                     if let Some(entry) = single_entry_to_resolve {
-                        let parent_abs_path = pane
-                            .update(cx, |pane, cx| {
-                                pane.workspace.update(cx, |workspace, cx| {
-                                    let project = workspace.project().read(cx);
-                                    project.worktree_for_entry(entry, cx).and_then(|worktree| {
-                                        let worktree = worktree.read(cx);
-                                        let entry = worktree.entry_for_id(entry)?;
-                                        let abs_path = worktree.absolutize(&entry.path).ok()?;
-                                        let parent = if entry.is_symlink {
-                                            abs_path.canonicalize().ok()?
-                                        } else {
-                                            abs_path
-                                        }
-                                        .parent()?
-                                        .to_path_buf();
-                                        Some(parent)
-                                    })
-                                })
-                            })
-                            .ok()
-                            .flatten();
+                        let entry_abs_path = pane.read(cx).entry_abs_path(entry, cx);
+                        let parent_abs_path = entry_abs_path
+                            .as_deref()
+                            .and_then(|abs_path| Some(abs_path.parent()?.to_path_buf()));
 
                         let entry_id = entry.to_proto();
                         menu = menu
+                            .separator()
+                            .when_some(entry_abs_path, |menu, abs_path| {
+                                menu.entry(
+                                    "Copy Path",
+                                    Some(Box::new(CopyPath)),
+                                    cx.handler_for(&pane, move |_, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new(
+                                            abs_path.to_string_lossy().to_string(),
+                                        ));
+                                    }),
+                                )
+                            })
+                            .entry(
+                                "Copy Relative Path",
+                                Some(Box::new(CopyRelativePath)),
+                                cx.handler_for(&pane, move |pane, cx| {
+                                    pane.copy_relative_path(&CopyRelativePath, cx);
+                                }),
+                            )
                             .separator()
                             .entry(
                                 "Reveal In Project Panel",
@@ -1770,14 +1830,14 @@ impl Pane {
                                     });
                                 }),
                             )
-                            .when_some(parent_abs_path, |menu, abs_path| {
+                            .when_some(parent_abs_path, |menu, parent_abs_path| {
                                 menu.entry(
                                     "Open in Terminal",
                                     Some(Box::new(OpenInTerminal)),
                                     cx.handler_for(&pane, move |_, cx| {
                                         cx.dispatch_action(
                                             OpenTerminal {
-                                                working_directory: abs_path.clone(),
+                                                working_directory: parent_abs_path.clone(),
                                             }
                                             .boxed_clone(),
                                         );
@@ -1817,7 +1877,11 @@ impl Pane {
             .track_scroll(self.tab_bar_scroll_handle.clone())
             .when(
                 self.display_nav_history_buttons.unwrap_or_default(),
-                |tab_bar| tab_bar.start_children(vec![navigate_backward, navigate_forward]),
+                |tab_bar| {
+                    tab_bar
+                        .start_child(navigate_backward)
+                        .start_child(navigate_forward)
+                },
             )
             .when(self.has_focus(cx), |tab_bar| {
                 tab_bar.end_child({
@@ -1830,7 +1894,7 @@ impl Pane {
                     .iter()
                     .enumerate()
                     .zip(tab_details(&self.items, cx))
-                    .map(|((ix, item), detail)| self.render_tab(ix, item, detail, cx)),
+                    .map(|((ix, item), detail)| self.render_tab(ix, &**item, detail, cx)),
             )
             .child(
                 div()
@@ -2196,7 +2260,7 @@ impl Render for Pane {
                 pane.child(self.render_tab_bar(cx))
             })
             .child({
-                let has_worktrees = self.project.read(cx).worktrees().next().is_some();
+                let has_worktrees = self.project.read(cx).worktrees(cx).next().is_some();
                 // main content
                 div()
                     .flex_1()

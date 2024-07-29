@@ -1,11 +1,13 @@
 mod dev_servers;
 pub mod disconnected_overlay;
+mod ssh_connections;
+mod ssh_remotes;
+pub use ssh_connections::open_ssh_project;
 
 use client::{DevServerProjectId, ProjectId};
 use dev_servers::reconnect_to_dev_server_project;
 pub use dev_servers::DevServerProjects;
 use disconnected_overlay::DisconnectedOverlay;
-use feature_flags::FeatureFlagAppExt;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     Action, AnyElement, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView,
@@ -18,6 +20,8 @@ use picker::{
 };
 use rpc::proto::DevServerStatus;
 use serde::Deserialize;
+use settings::Settings;
+use ssh_connections::SshSettings;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -45,6 +49,7 @@ gpui::impl_actions!(projects, [OpenRecent]);
 gpui::actions!(projects, [OpenRemote]);
 
 pub fn init(cx: &mut AppContext) {
+    SshSettings::register(cx);
     cx.observe_new_views(RecentProjects::register).detach();
     cx.observe_new_views(DevServerProjects::register).detach();
     cx.observe_new_views(DisconnectedOverlay::register).detach();
@@ -93,7 +98,7 @@ impl RecentProjects {
         }
     }
 
-    fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
+    fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
         workspace.register_action(|workspace, open_recent: &OpenRecent, cx| {
             let Some(recent_projects) = workspace.active_modal::<Self>(cx) else {
                 Self::open(workspace, open_recent.create_new_window, cx);
@@ -106,6 +111,20 @@ impl RecentProjects {
                     .update(cx, |picker, cx| picker.cycle_selection(cx))
             });
         });
+        if workspace
+            .project()
+            .read(cx)
+            .dev_server_project_id()
+            .is_some()
+        {
+            workspace.register_action(|workspace, _: &workspace::Open, cx| {
+                if workspace.active_modal::<Self>(cx).is_some() {
+                    cx.propagate();
+                } else {
+                    Self::open(workspace, true, cx);
+                }
+            });
+        }
     }
 
     pub fn open(
@@ -224,16 +243,18 @@ impl PickerDelegate for RecentProjectsDelegate {
             .filter(|(_, (id, _))| !self.is_current_workspace(*id, cx))
             .map(|(id, (_, location))| {
                 let combined_string = match location {
-                    SerializedWorkspaceLocation::Local(paths, _) => paths
-                        .paths()
+                    SerializedWorkspaceLocation::Local(paths, order) => order
+                        .order()
                         .iter()
+                        .filter_map(|i| paths.paths().get(*i))
                         .map(|path| path.compact().to_string_lossy().into_owned())
                         .collect::<Vec<_>>()
                         .join(""),
                     SerializedWorkspaceLocation::DevServer(dev_server_project) => {
                         format!(
                             "{}{}",
-                            dev_server_project.dev_server_name, dev_server_project.path
+                            dev_server_project.dev_server_name,
+                            dev_server_project.paths.join("")
                         )
                     }
                 };
@@ -285,7 +306,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                     } else {
                         match candidate_workspace_location {
                             SerializedWorkspaceLocation::Local(paths, _) => {
-                                let paths = paths.paths().as_ref().clone();
+                                let paths = paths.paths().to_vec();
                                 if replace_current_window {
                                     cx.spawn(move |workspace, mut cx| async move {
                                         let continue_replacing = workspace
@@ -389,11 +410,18 @@ impl PickerDelegate for RecentProjectsDelegate {
 
         let mut path_start_offset = 0;
         let paths = match location {
-            SerializedWorkspaceLocation::Local(paths, _) => paths.paths(),
+            SerializedWorkspaceLocation::Local(paths, order) => Arc::new(
+                order
+                    .order()
+                    .iter()
+                    .filter_map(|i| paths.paths().get(*i).cloned())
+                    .collect(),
+            ),
             SerializedWorkspaceLocation::DevServer(dev_server_project) => {
                 Arc::new(vec![PathBuf::from(format!(
                     "{}:{}",
-                    dev_server_project.dev_server_name, dev_server_project.path
+                    dev_server_project.dev_server_name,
+                    dev_server_project.paths.join(", ")
                 ))])
             }
         };
@@ -495,9 +523,6 @@ impl PickerDelegate for RecentProjectsDelegate {
     }
 
     fn render_footer(&self, cx: &mut ViewContext<Picker<Self>>) -> Option<AnyElement> {
-        if !cx.has_flag::<feature_flags::Remoting>() {
-            return None;
-        }
         Some(
             h_flex()
                 .border_t_1()
@@ -511,7 +536,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         .when_some(KeyBinding::for_action(&OpenRemote, cx), |button, key| {
                             button.child(key)
                         })
-                        .child(Label::new("New remote project…").color(Color::Muted))
+                        .child(Label::new("Open remote folder…").color(Color::Muted))
                         .on_click(|_, cx| cx.dispatch_action(OpenRemote.boxed_clone())),
                 )
                 .child(
@@ -684,16 +709,26 @@ mod tests {
     use std::path::PathBuf;
 
     use editor::Editor;
-    use gpui::{TestAppContext, WindowHandle};
-    use project::Project;
+    use gpui::{TestAppContext, UpdateGlobal, WindowHandle};
+    use project::{project_settings::ProjectSettings, Project};
     use serde_json::json;
-    use workspace::{open_paths, AppState, LocalPaths};
+    use settings::SettingsStore;
+    use workspace::{open_paths, AppState};
 
     use super::*;
 
     #[gpui::test]
     async fn test_prompts_on_dirty_before_submit(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings::<ProjectSettings>(cx, |settings| {
+                    settings.session.restore_unsaved_buffers = false
+                });
+            });
+        });
+
         app_state
             .fs
             .as_fake()
@@ -753,7 +788,7 @@ mod tests {
                     }];
                     delegate.set_workspaces(vec![(
                         WorkspaceId::default(),
-                        LocalPaths::new(vec!["/test/path/"]).into(),
+                        SerializedWorkspaceLocation::from_local_paths(vec!["/test/path/"]),
                     )]);
                 });
             })

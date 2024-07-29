@@ -300,6 +300,9 @@ pub struct ThemeColorsContent {
     #[serde(rename = "title_bar.background")]
     pub title_bar_background: Option<String>,
 
+    #[serde(rename = "title_bar.inactive_background")]
+    pub title_bar_inactive_background: Option<String>,
+
     #[serde(rename = "toolbar.background")]
     pub toolbar_background: Option<String>,
 
@@ -327,11 +330,15 @@ pub struct ThemeColorsContent {
     #[serde(rename = "pane_group.border")]
     pub pane_group_border: Option<String>,
 
+    /// The deprecated version of `scrollbar.thumb.background`.
+    ///
+    /// Don't use this field.
+    #[serde(rename = "scrollbar_thumb.background", skip_serializing)]
+    #[schemars(skip)]
+    pub deprecated_scrollbar_thumb_background: Option<String>,
+
     /// The color of the scrollbar thumb.
-    #[serde(
-        rename = "scrollbar.thumb.background",
-        alias = "scrollbar_thumb.background"
-    )]
+    #[serde(rename = "scrollbar.thumb.background")]
     pub scrollbar_thumb_background: Option<String>,
 
     /// The color of the scrollbar thumb when hovered over.
@@ -659,6 +666,10 @@ impl ThemeColorsContent {
                 .title_bar_background
                 .as_ref()
                 .and_then(|color| try_parse_color(color).ok()),
+            title_bar_inactive_background: self
+                .title_bar_inactive_background
+                .as_ref()
+                .and_then(|color| try_parse_color(color).ok()),
             toolbar_background: self
                 .toolbar_background
                 .as_ref()
@@ -699,7 +710,12 @@ impl ThemeColorsContent {
             scrollbar_thumb_background: self
                 .scrollbar_thumb_background
                 .as_ref()
-                .and_then(|color| try_parse_color(color).ok()),
+                .and_then(|color| try_parse_color(color).ok())
+                .or_else(|| {
+                    self.deprecated_scrollbar_thumb_background
+                        .as_ref()
+                        .and_then(|color| try_parse_color(color).ok())
+                }),
             scrollbar_thumb_hover_background: self
                 .scrollbar_thumb_hover_background
                 .as_ref()

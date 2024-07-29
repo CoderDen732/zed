@@ -27,7 +27,7 @@ use collections::{HashMap, HashSet};
 use futures::Future;
 use gpui::{AppContext, AsyncAppContext, Model, SharedString, Task};
 pub use highlight_map::HighlightMap;
-use http::HttpClient;
+use http_client::HttpClient;
 use lazy_static::lazy_static;
 use lsp::{CodeActionKind, LanguageServerBinary};
 use parking_lot::Mutex;
@@ -61,6 +61,7 @@ use task::RunnableTag;
 pub use task_context::{ContextProvider, RunnableRange};
 use theme::SyntaxTheme;
 use tree_sitter::{self, wasmtime, Query, QueryCursor, WasmStore};
+use util::serde::default_true;
 
 pub use buffer::Operation;
 pub use buffer::*;
@@ -121,7 +122,7 @@ lazy_static! {
     pub static ref PLAIN_TEXT: Arc<Language> = Arc::new(Language::new(
         LanguageConfig {
             name: "Plain Text".into(),
-            soft_wrap: Some(SoftWrap::PreferredLineLength),
+            soft_wrap: Some(SoftWrap::EditorWidth),
             ..Default::default()
         },
         None,
@@ -681,7 +682,7 @@ impl<T> Override<T> {
 impl Default for LanguageConfig {
     fn default() -> Self {
         Self {
-            name: "".into(),
+            name: Arc::default(),
             code_fence_block_name: None,
             grammar: None,
             matcher: LanguageMatcher::default(),
@@ -803,6 +804,9 @@ pub struct BracketPair {
     pub end: String,
     /// True if `end` should be automatically inserted right after `start` characters.
     pub close: bool,
+    /// True if selected text should be surrounded by `start` and `end` characters.
+    #[serde(default = "default_true")]
+    pub surround: bool,
     /// True if an extra newline should be inserted while the cursor is in the middle
     /// of that bracket pair.
     pub newline: bool,
@@ -863,6 +867,8 @@ pub struct OutlineConfig {
     pub name_capture_ix: u32,
     pub context_capture_ix: Option<u32>,
     pub extra_context_capture_ix: Option<u32>,
+    pub open_capture_ix: Option<u32>,
+    pub close_capture_ix: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -1046,6 +1052,8 @@ impl Language {
         let mut name_capture_ix = None;
         let mut context_capture_ix = None;
         let mut extra_context_capture_ix = None;
+        let mut open_capture_ix = None;
+        let mut close_capture_ix = None;
         get_capture_indices(
             &query,
             &mut [
@@ -1053,6 +1061,8 @@ impl Language {
                 ("name", &mut name_capture_ix),
                 ("context", &mut context_capture_ix),
                 ("context.extra", &mut extra_context_capture_ix),
+                ("open", &mut open_capture_ix),
+                ("close", &mut close_capture_ix),
             ],
         );
         if let Some((item_capture_ix, name_capture_ix)) = item_capture_ix.zip(name_capture_ix) {
@@ -1062,6 +1072,8 @@ impl Language {
                 name_capture_ix,
                 context_capture_ix,
                 extra_context_capture_ix,
+                open_capture_ix,
+                close_capture_ix,
             });
         }
         Ok(self)

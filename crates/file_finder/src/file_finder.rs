@@ -2,17 +2,19 @@
 mod file_finder_tests;
 
 mod new_path_prompt;
+mod open_path_prompt;
 
 use collections::{BTreeSet, HashMap};
 use editor::{scroll::Autoscroll, Bias, Editor};
 use fuzzy::{CharBag, PathMatch, PathMatchCandidate};
 use gpui::{
-    actions, impl_actions, rems, Action, AnyElement, AppContext, DismissEvent, EventEmitter,
-    FocusHandle, FocusableView, Model, Modifiers, ModifiersChangedEvent, ParentElement, Render,
-    Styled, Task, View, ViewContext, VisualContext, WeakView,
+    actions, rems, Action, AnyElement, AppContext, DismissEvent, EventEmitter, FocusHandle,
+    FocusableView, Model, Modifiers, ModifiersChangedEvent, ParentElement, Render, Styled, Task,
+    View, ViewContext, VisualContext, WeakView,
 };
 use itertools::Itertools;
 use new_path_prompt::NewPathPrompt;
+use open_path_prompt::OpenPathPrompt;
 use picker::{Picker, PickerDelegate};
 use project::{PathMatchCandidateSet, Project, ProjectPath, WorktreeId};
 use settings::Settings;
@@ -30,13 +32,6 @@ use util::{paths::PathLikeWithPosition, post_inc, ResultExt};
 use workspace::{item::PreviewTabsSettings, ModalView, Workspace};
 
 actions!(file_finder, [SelectPrev]);
-impl_actions!(file_finder, [Toggle]);
-
-#[derive(Default, PartialEq, Eq, Clone, serde::Deserialize)]
-pub struct Toggle {
-    #[serde(default)]
-    pub separate_history: bool,
-}
 
 impl ModalView for FileFinder {}
 
@@ -48,11 +43,12 @@ pub struct FileFinder {
 pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(FileFinder::register).detach();
     cx.observe_new_views(NewPathPrompt::register).detach();
+    cx.observe_new_views(OpenPathPrompt::register).detach();
 }
 
 impl FileFinder {
     fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
-        workspace.register_action(|workspace, action: &Toggle, cx| {
+        workspace.register_action(|workspace, action: &workspace::ToggleFileFinder, cx| {
             let Some(file_finder) = workspace.active_modal::<Self>(cx) else {
                 Self::open(workspace, action.separate_history, cx);
                 return;
@@ -683,7 +679,7 @@ impl FileFinderDelegate {
                     let update_result = project
                         .update(&mut cx, |project, cx| {
                             if let Some((worktree, relative_path)) =
-                                project.find_local_worktree(query_path, cx)
+                                project.find_worktree(query_path, cx)
                             {
                                 path_matches.push(ProjectPanelOrdMatch(PathMatch {
                                     score: 1.0,
@@ -800,17 +796,18 @@ impl PickerDelegate for FileFinderDelegate {
             cx.notify();
             Task::ready(())
         } else {
-            let query = PathLikeWithPosition::parse_str(raw_query, |path_like_str| {
-                Ok::<_, std::convert::Infallible>(FileSearchQuery {
-                    raw_query: raw_query.to_owned(),
-                    file_query_end: if path_like_str == raw_query {
-                        None
-                    } else {
-                        Some(path_like_str.len())
-                    },
+            let query =
+                PathLikeWithPosition::parse_str(&raw_query, |normalized_query, path_like_str| {
+                    Ok::<_, std::convert::Infallible>(FileSearchQuery {
+                        raw_query: normalized_query.to_owned(),
+                        file_query_end: if path_like_str == raw_query {
+                            None
+                        } else {
+                            Some(path_like_str.len())
+                        },
+                    })
                 })
-            })
-            .expect("infallible");
+                .expect("infallible");
 
             if Path::new(query.path_like.path_query()).is_absolute() {
                 self.lookup_absolute_path(query, cx)
@@ -1001,7 +998,7 @@ mod tests {
                 positions: Vec::new(),
                 worktree_id: 0,
                 path: Arc::from(Path::new("b0.5")),
-                path_prefix: Arc::from(""),
+                path_prefix: Arc::default(),
                 distance_to_relative_ancestor: 0,
             }),
             ProjectPanelOrdMatch(PathMatch {
@@ -1009,7 +1006,7 @@ mod tests {
                 positions: Vec::new(),
                 worktree_id: 0,
                 path: Arc::from(Path::new("c1.0")),
-                path_prefix: Arc::from(""),
+                path_prefix: Arc::default(),
                 distance_to_relative_ancestor: 0,
             }),
             ProjectPanelOrdMatch(PathMatch {
@@ -1017,7 +1014,7 @@ mod tests {
                 positions: Vec::new(),
                 worktree_id: 0,
                 path: Arc::from(Path::new("a1.0")),
-                path_prefix: Arc::from(""),
+                path_prefix: Arc::default(),
                 distance_to_relative_ancestor: 0,
             }),
             ProjectPanelOrdMatch(PathMatch {
@@ -1025,7 +1022,7 @@ mod tests {
                 positions: Vec::new(),
                 worktree_id: 0,
                 path: Arc::from(Path::new("a0.5")),
-                path_prefix: Arc::from(""),
+                path_prefix: Arc::default(),
                 distance_to_relative_ancestor: 0,
             }),
             ProjectPanelOrdMatch(PathMatch {
@@ -1033,7 +1030,7 @@ mod tests {
                 positions: Vec::new(),
                 worktree_id: 0,
                 path: Arc::from(Path::new("b1.0")),
-                path_prefix: Arc::from(""),
+                path_prefix: Arc::default(),
                 distance_to_relative_ancestor: 0,
             }),
         ];
@@ -1047,7 +1044,7 @@ mod tests {
                     positions: Vec::new(),
                     worktree_id: 0,
                     path: Arc::from(Path::new("a1.0")),
-                    path_prefix: Arc::from(""),
+                    path_prefix: Arc::default(),
                     distance_to_relative_ancestor: 0,
                 }),
                 ProjectPanelOrdMatch(PathMatch {
@@ -1055,7 +1052,7 @@ mod tests {
                     positions: Vec::new(),
                     worktree_id: 0,
                     path: Arc::from(Path::new("b1.0")),
-                    path_prefix: Arc::from(""),
+                    path_prefix: Arc::default(),
                     distance_to_relative_ancestor: 0,
                 }),
                 ProjectPanelOrdMatch(PathMatch {
@@ -1063,7 +1060,7 @@ mod tests {
                     positions: Vec::new(),
                     worktree_id: 0,
                     path: Arc::from(Path::new("c1.0")),
-                    path_prefix: Arc::from(""),
+                    path_prefix: Arc::default(),
                     distance_to_relative_ancestor: 0,
                 }),
                 ProjectPanelOrdMatch(PathMatch {
@@ -1071,7 +1068,7 @@ mod tests {
                     positions: Vec::new(),
                     worktree_id: 0,
                     path: Arc::from(Path::new("a0.5")),
-                    path_prefix: Arc::from(""),
+                    path_prefix: Arc::default(),
                     distance_to_relative_ancestor: 0,
                 }),
                 ProjectPanelOrdMatch(PathMatch {
@@ -1079,7 +1076,7 @@ mod tests {
                     positions: Vec::new(),
                     worktree_id: 0,
                     path: Arc::from(Path::new("b0.5")),
-                    path_prefix: Arc::from(""),
+                    path_prefix: Arc::default(),
                     distance_to_relative_ancestor: 0,
                 }),
             ]

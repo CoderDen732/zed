@@ -14,12 +14,11 @@ use derive_more::{Deref, DerefMut};
 use futures::{channel::oneshot, future::LocalBoxFuture, Future};
 use slotmap::SlotMap;
 use smol::future::FutureExt;
-use time::UtcOffset;
 
 pub use async_context::*;
 use collections::{FxHashMap, FxHashSet, VecDeque};
 pub use entity_map::*;
-use http::{self, HttpClient};
+use http_client::HttpClient;
 pub use model_context::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
@@ -113,9 +112,20 @@ impl App {
         log::info!("GPUI was compiled in test mode");
 
         Self(AppContext::new(
-            current_platform(),
+            current_platform(false),
             Arc::new(()),
-            http::client(None),
+            http_client::client(None),
+        ))
+    }
+
+    /// Build an app in headless mode. This prevents opening windows,
+    /// but makes it possible to run an application in an context like
+    /// SSH, where GUI applications are not allowed.
+    pub fn headless() -> Self {
+        Self(AppContext::new(
+            current_platform(true),
+            Arc::new(()),
+            http_client::client(None),
         ))
     }
 
@@ -479,6 +489,7 @@ impl AppContext {
                 Ok(mut window) => {
                     let root_view = build_root_view(&mut WindowContext::new(cx, &mut window));
                     window.root_view.replace(root_view.into());
+                    WindowContext::new(cx, &mut window).defer(|cx| cx.appearance_changed());
                     cx.window_handles.insert(id, window.handle);
                     cx.windows.get_mut(id).unwrap().replace(window);
                     Ok(handle)
@@ -611,10 +622,11 @@ impl AppContext {
     /// Displays a platform modal for selecting paths.
     /// When one or more paths are selected, they'll be relayed asynchronously via the returned oneshot channel.
     /// If cancelled, a `None` will be relayed instead.
+    /// May return an error on Linux if the file picker couldn't be opened.
     pub fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
-    ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         self.platform.prompt_for_paths(options)
     }
 
@@ -622,7 +634,11 @@ impl AppContext {
     /// The provided directory will be used to set the initial location.
     /// When a path is selected, it is relayed asynchronously via the returned oneshot channel.
     /// If cancelled, a `None` will be relayed instead.
-    pub fn prompt_for_new_path(&self, directory: &Path) -> oneshot::Receiver<Option<PathBuf>> {
+    /// May return an error on Linux if the file picker couldn't be opened.
+    pub fn prompt_for_new_path(
+        &self,
+        directory: &Path,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         self.platform.prompt_for_new_path(directory)
     }
 
@@ -639,11 +655,6 @@ impl AppContext {
     /// Restart the application.
     pub fn restart(&self, binary_path: Option<PathBuf>) {
         self.platform.restart(binary_path)
-    }
-
-    /// Returns the local timezone at the platform level.
-    pub fn local_timezone(&self) -> UtcOffset {
-        self.platform.local_timezone()
     }
 
     /// Updates the http client assigned to GPUI
@@ -1119,14 +1130,7 @@ impl AppContext {
         for window in self.windows() {
             window
                 .update(self, |_, cx| {
-                    cx.window
-                        .rendered_frame
-                        .dispatch_tree
-                        .clear_pending_keystrokes();
-                    cx.window
-                        .next_frame
-                        .dispatch_tree
-                        .clear_pending_keystrokes();
+                    cx.clear_pending_keystrokes();
                 })
                 .ok();
         }
