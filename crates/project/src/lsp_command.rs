@@ -1,9 +1,10 @@
 mod signature_help;
 
 use crate::{
-    CodeAction, CoreCompletion, DocumentHighlight, Hover, HoverBlock, HoverBlockKind, InlayHint,
-    InlayHintLabel, InlayHintLabelPart, InlayHintLabelPartTooltip, InlayHintTooltip, Location,
-    LocationLink, MarkupContent, Project, ProjectTransaction, ResolveState,
+    buffer_store::BufferStore, lsp_store::LspStore, CodeAction, CoreCompletion, DocumentHighlight,
+    Hover, HoverBlock, HoverBlockKind, InlayHint, InlayHintLabel, InlayHintLabelPart,
+    InlayHintLabelPartTooltip, InlayHintTooltip, Location, LocationLink, MarkupContent,
+    ProjectTransaction, ResolveState,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use client::proto::{self, PeerId};
 use clock::Global;
 use collections::HashSet;
 use futures::future;
-use gpui::{AppContext, AsyncAppContext, Model};
+use gpui::{AppContext, AsyncAppContext, Entity, Model};
 use language::{
     language_settings::{language_settings, InlayHintKind, LanguageSettings},
     point_from_lsp, point_to_lsp,
@@ -69,7 +70,7 @@ pub trait LspCommand: 'static + Sized + Send {
     async fn response_from_lsp(
         self,
         message: <Self::LspRequest as lsp::request::Request>::Result,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         cx: AsyncAppContext,
@@ -79,14 +80,14 @@ pub trait LspCommand: 'static + Sized + Send {
 
     async fn from_proto(
         message: Self::ProtoRequest,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         cx: AsyncAppContext,
     ) -> Result<Self>;
 
     fn response_to_proto(
         response: Self::Response,
-        project: &mut Project,
+        lsp_store: &mut LspStore,
         peer_id: PeerId,
         buffer_version: &clock::Global,
         cx: &mut AppContext,
@@ -95,7 +96,7 @@ pub trait LspCommand: 'static + Sized + Send {
     async fn response_from_proto(
         self,
         message: <Self::ProtoRequest as proto::RequestMessage>::Response,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         cx: AsyncAppContext,
     ) -> Result<Self::Response>;
@@ -114,6 +115,10 @@ pub(crate) struct PerformRename {
 }
 
 pub struct GetDefinition {
+    pub position: PointUtf16,
+}
+
+pub(crate) struct GetDeclaration {
     pub position: PointUtf16,
 }
 
@@ -201,7 +206,7 @@ impl LspCommand for PrepareRename {
     async fn response_from_lsp(
         self,
         message: Option<lsp::PrepareRenameResponse>,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         _: LanguageServerId,
         mut cx: AsyncAppContext,
@@ -236,7 +241,7 @@ impl LspCommand for PrepareRename {
 
     async fn from_proto(
         message: proto::PrepareRename,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -257,7 +262,7 @@ impl LspCommand for PrepareRename {
 
     fn response_to_proto(
         range: Option<Range<Anchor>>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         buffer_version: &clock::Global,
         _: &mut AppContext,
@@ -277,7 +282,7 @@ impl LspCommand for PrepareRename {
     async fn response_from_proto(
         self,
         message: proto::PrepareRenameResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Option<Range<Anchor>>> {
@@ -328,16 +333,16 @@ impl LspCommand for PerformRename {
     async fn response_from_lsp(
         self,
         message: Option<lsp::WorkspaceEdit>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         mut cx: AsyncAppContext,
     ) -> Result<ProjectTransaction> {
         if let Some(edit) = message {
             let (lsp_adapter, lsp_server) =
-                language_server_for_buffer(&project, &buffer, server_id, &mut cx)?;
-            Project::deserialize_workspace_edit(
-                project,
+                language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
+            LspStore::deserialize_workspace_edit(
+                lsp_store,
                 edit,
                 self.push_to_history,
                 lsp_adapter,
@@ -364,7 +369,7 @@ impl LspCommand for PerformRename {
 
     async fn from_proto(
         message: proto::PerformRename,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -386,12 +391,14 @@ impl LspCommand for PerformRename {
 
     fn response_to_proto(
         response: ProjectTransaction,
-        project: &mut Project,
+        lsp_store: &mut LspStore,
         peer_id: PeerId,
         _: &clock::Global,
         cx: &mut AppContext,
     ) -> proto::PerformRenameResponse {
-        let transaction = project.serialize_project_transaction_for_peer(response, peer_id, cx);
+        let transaction = lsp_store.buffer_store().update(cx, |buffer_store, cx| {
+            buffer_store.serialize_project_transaction_for_peer(response, peer_id, cx)
+        });
         proto::PerformRenameResponse {
             transaction: Some(transaction),
         }
@@ -400,15 +407,15 @@ impl LspCommand for PerformRename {
     async fn response_from_proto(
         self,
         message: proto::PerformRenameResponse,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         _: Model<Buffer>,
         cx: AsyncAppContext,
     ) -> Result<ProjectTransaction> {
         let message = message
             .transaction
             .ok_or_else(|| anyhow!("missing transaction"))?;
-        Project::deserialize_project_transaction(
-            project.downgrade(),
+        BufferStore::deserialize_project_transaction(
+            lsp_store.read_with(&cx, |lsp_store, _| lsp_store.buffer_store().downgrade())?,
             message,
             self.push_to_history,
             cx,
@@ -456,12 +463,12 @@ impl LspCommand for GetDefinition {
     async fn response_from_lsp(
         self,
         message: Option<lsp::GotoDefinitionResponse>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         cx: AsyncAppContext,
     ) -> Result<Vec<LocationLink>> {
-        location_links_from_lsp(message, project, buffer, server_id, cx).await
+        location_links_from_lsp(message, lsp_store, buffer, server_id, cx).await
     }
 
     fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetDefinition {
@@ -477,7 +484,7 @@ impl LspCommand for GetDefinition {
 
     async fn from_proto(
         message: proto::GetDefinition,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -497,26 +504,126 @@ impl LspCommand for GetDefinition {
 
     fn response_to_proto(
         response: Vec<LocationLink>,
-        project: &mut Project,
+        lsp_store: &mut LspStore,
         peer_id: PeerId,
         _: &clock::Global,
         cx: &mut AppContext,
     ) -> proto::GetDefinitionResponse {
-        let links = location_links_to_proto(response, project, peer_id, cx);
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
         proto::GetDefinitionResponse { links }
     }
 
     async fn response_from_proto(
         self,
         message: proto::GetDefinitionResponse,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         _: Model<Buffer>,
         cx: AsyncAppContext,
     ) -> Result<Vec<LocationLink>> {
-        location_links_from_proto(message.links, project, cx).await
+        location_links_from_proto(message.links, lsp_store, cx).await
     }
 
     fn buffer_id_from_proto(message: &proto::GetDefinition) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
+}
+
+#[async_trait(?Send)]
+impl LspCommand for GetDeclaration {
+    type Response = Vec<LocationLink>;
+    type LspRequest = lsp::request::GotoDeclaration;
+    type ProtoRequest = proto::GetDeclaration;
+
+    fn check_capabilities(&self, capabilities: AdapterServerCapabilities) -> bool {
+        capabilities
+            .server_capabilities
+            .declaration_provider
+            .is_some()
+    }
+
+    fn to_lsp(
+        &self,
+        path: &Path,
+        _: &Buffer,
+        _: &Arc<LanguageServer>,
+        _: &AppContext,
+    ) -> lsp::GotoDeclarationParams {
+        lsp::GotoDeclarationParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document: lsp::TextDocumentIdentifier {
+                    uri: lsp::Url::from_file_path(path).unwrap(),
+                },
+                position: point_to_lsp(self.position),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    async fn response_from_lsp(
+        self,
+        message: Option<lsp::GotoDeclarationResponse>,
+        lsp_store: Model<LspStore>,
+        buffer: Model<Buffer>,
+        server_id: LanguageServerId,
+        cx: AsyncAppContext,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_lsp(message, lsp_store, buffer, server_id, cx).await
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetDeclaration {
+        proto::GetDeclaration {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetDeclaration,
+        _: Model<LspStore>,
+        buffer: Model<Buffer>,
+        mut cx: AsyncAppContext,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .ok_or_else(|| anyhow!("invalid position"))?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.update(&mut cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<LocationLink>,
+        lsp_store: &mut LspStore,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut AppContext,
+    ) -> proto::GetDeclarationResponse {
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
+        proto::GetDeclarationResponse { links }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetDeclarationResponse,
+        lsp_store: Model<LspStore>,
+        _: Model<Buffer>,
+        cx: AsyncAppContext,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, lsp_store, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetDeclaration) -> Result<BufferId> {
         BufferId::new(message.buffer_id)
     }
 }
@@ -549,12 +656,12 @@ impl LspCommand for GetImplementation {
     async fn response_from_lsp(
         self,
         message: Option<lsp::GotoImplementationResponse>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         cx: AsyncAppContext,
     ) -> Result<Vec<LocationLink>> {
-        location_links_from_lsp(message, project, buffer, server_id, cx).await
+        location_links_from_lsp(message, lsp_store, buffer, server_id, cx).await
     }
 
     fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetImplementation {
@@ -570,7 +677,7 @@ impl LspCommand for GetImplementation {
 
     async fn from_proto(
         message: proto::GetImplementation,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -590,19 +697,19 @@ impl LspCommand for GetImplementation {
 
     fn response_to_proto(
         response: Vec<LocationLink>,
-        project: &mut Project,
+        lsp_store: &mut LspStore,
         peer_id: PeerId,
         _: &clock::Global,
         cx: &mut AppContext,
     ) -> proto::GetImplementationResponse {
-        let links = location_links_to_proto(response, project, peer_id, cx);
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
         proto::GetImplementationResponse { links }
     }
 
     async fn response_from_proto(
         self,
         message: proto::GetImplementationResponse,
-        project: Model<Project>,
+        project: Model<LspStore>,
         _: Model<Buffer>,
         cx: AsyncAppContext,
     ) -> Result<Vec<LocationLink>> {
@@ -650,7 +757,7 @@ impl LspCommand for GetTypeDefinition {
     async fn response_from_lsp(
         self,
         message: Option<lsp::GotoTypeDefinitionResponse>,
-        project: Model<Project>,
+        project: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         cx: AsyncAppContext,
@@ -671,7 +778,7 @@ impl LspCommand for GetTypeDefinition {
 
     async fn from_proto(
         message: proto::GetTypeDefinition,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -691,19 +798,19 @@ impl LspCommand for GetTypeDefinition {
 
     fn response_to_proto(
         response: Vec<LocationLink>,
-        project: &mut Project,
+        lsp_store: &mut LspStore,
         peer_id: PeerId,
         _: &clock::Global,
         cx: &mut AppContext,
     ) -> proto::GetTypeDefinitionResponse {
-        let links = location_links_to_proto(response, project, peer_id, cx);
+        let links = location_links_to_proto(response, lsp_store, peer_id, cx);
         proto::GetTypeDefinitionResponse { links }
     }
 
     async fn response_from_proto(
         self,
         message: proto::GetTypeDefinitionResponse,
-        project: Model<Project>,
+        project: Model<LspStore>,
         _: Model<Buffer>,
         cx: AsyncAppContext,
     ) -> Result<Vec<LocationLink>> {
@@ -716,14 +823,14 @@ impl LspCommand for GetTypeDefinition {
 }
 
 fn language_server_for_buffer(
-    project: &Model<Project>,
+    lsp_store: &Model<LspStore>,
     buffer: &Model<Buffer>,
     server_id: LanguageServerId,
     cx: &mut AsyncAppContext,
 ) -> Result<(Arc<CachedLspAdapter>, Arc<LanguageServer>)> {
-    project
-        .update(cx, |project, cx| {
-            project
+    lsp_store
+        .update(cx, |lsp_store, cx| {
+            lsp_store
                 .language_server_for_buffer(buffer.read(cx), server_id, cx)
                 .map(|(adapter, server)| (adapter.clone(), server.clone()))
         })?
@@ -732,7 +839,7 @@ fn language_server_for_buffer(
 
 async fn location_links_from_proto(
     proto_links: Vec<proto::LocationLink>,
-    project: Model<Project>,
+    lsp_store: Model<LspStore>,
     mut cx: AsyncAppContext,
 ) -> Result<Vec<LocationLink>> {
     let mut links = Vec::new();
@@ -741,9 +848,9 @@ async fn location_links_from_proto(
         let origin = match link.origin {
             Some(origin) => {
                 let buffer_id = BufferId::new(origin.buffer_id)?;
-                let buffer = project
-                    .update(&mut cx, |this, cx| {
-                        this.wait_for_remote_buffer(buffer_id, cx)
+                let buffer = lsp_store
+                    .update(&mut cx, |lsp_store, cx| {
+                        lsp_store.wait_for_remote_buffer(buffer_id, cx)
                     })?
                     .await?;
                 let start = origin
@@ -767,9 +874,9 @@ async fn location_links_from_proto(
 
         let target = link.target.ok_or_else(|| anyhow!("missing target"))?;
         let buffer_id = BufferId::new(target.buffer_id)?;
-        let buffer = project
-            .update(&mut cx, |this, cx| {
-                this.wait_for_remote_buffer(buffer_id, cx)
+        let buffer = lsp_store
+            .update(&mut cx, |lsp_store, cx| {
+                lsp_store.wait_for_remote_buffer(buffer_id, cx)
             })?
             .await?;
         let start = target
@@ -796,7 +903,7 @@ async fn location_links_from_proto(
 
 async fn location_links_from_lsp(
     message: Option<lsp::GotoDefinitionResponse>,
-    project: Model<Project>,
+    lsp_store: Model<LspStore>,
     buffer: Model<Buffer>,
     server_id: LanguageServerId,
     mut cx: AsyncAppContext,
@@ -828,10 +935,10 @@ async fn location_links_from_lsp(
     }
 
     let (lsp_adapter, language_server) =
-        language_server_for_buffer(&project, &buffer, server_id, &mut cx)?;
+        language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
     let mut definitions = Vec::new();
     for (origin_range, target_uri, target_range) in unresolved_links {
-        let target_buffer_handle = project
+        let target_buffer_handle = lsp_store
             .update(&mut cx, |this, cx| {
                 this.open_local_buffer_via_lsp(
                     target_uri,
@@ -878,7 +985,7 @@ async fn location_links_from_lsp(
 
 fn location_links_to_proto(
     links: Vec<LocationLink>,
-    project: &mut Project,
+    lsp_store: &mut LspStore,
     peer_id: PeerId,
     cx: &mut AppContext,
 ) -> Vec<proto::LocationLink> {
@@ -886,9 +993,14 @@ fn location_links_to_proto(
         .into_iter()
         .map(|definition| {
             let origin = definition.origin.map(|origin| {
-                let buffer_id = project
-                    .create_buffer_for_peer(&origin.buffer, peer_id, cx)
-                    .into();
+                lsp_store
+                    .buffer_store()
+                    .update(cx, |buffer_store, cx| {
+                        buffer_store.create_buffer_for_peer(&origin.buffer, peer_id, cx)
+                    })
+                    .detach_and_log_err(cx);
+
+                let buffer_id = origin.buffer.read(cx).remote_id().into();
                 proto::Location {
                     start: Some(serialize_anchor(&origin.range.start)),
                     end: Some(serialize_anchor(&origin.range.end)),
@@ -896,9 +1008,14 @@ fn location_links_to_proto(
                 }
             });
 
-            let buffer_id = project
-                .create_buffer_for_peer(&definition.target.buffer, peer_id, cx)
-                .into();
+            lsp_store
+                .buffer_store()
+                .update(cx, |buffer_store, cx| {
+                    buffer_store.create_buffer_for_peer(&definition.target.buffer, peer_id, cx)
+                })
+                .detach_and_log_err(cx);
+
+            let buffer_id = definition.target.buffer.read(cx).remote_id().into();
             let target = proto::Location {
                 start: Some(serialize_anchor(&definition.target.range.start)),
                 end: Some(serialize_anchor(&definition.target.range.end)),
@@ -956,20 +1073,20 @@ impl LspCommand for GetReferences {
     async fn response_from_lsp(
         self,
         locations: Option<Vec<lsp::Location>>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         mut cx: AsyncAppContext,
     ) -> Result<Vec<Location>> {
         let mut references = Vec::new();
         let (lsp_adapter, language_server) =
-            language_server_for_buffer(&project, &buffer, server_id, &mut cx)?;
+            language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
 
         if let Some(locations) = locations {
             for lsp_location in locations {
-                let target_buffer_handle = project
-                    .update(&mut cx, |this, cx| {
-                        this.open_local_buffer_via_lsp(
+                let target_buffer_handle = lsp_store
+                    .update(&mut cx, |lsp_store, cx| {
+                        lsp_store.open_local_buffer_via_lsp(
                             lsp_location.uri,
                             language_server.server_id(),
                             lsp_adapter.name.clone(),
@@ -1010,7 +1127,7 @@ impl LspCommand for GetReferences {
 
     async fn from_proto(
         message: proto::GetReferences,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -1030,7 +1147,7 @@ impl LspCommand for GetReferences {
 
     fn response_to_proto(
         response: Vec<Location>,
-        project: &mut Project,
+        lsp_store: &mut LspStore,
         peer_id: PeerId,
         _: &clock::Global,
         cx: &mut AppContext,
@@ -1038,7 +1155,13 @@ impl LspCommand for GetReferences {
         let locations = response
             .into_iter()
             .map(|definition| {
-                let buffer_id = project.create_buffer_for_peer(&definition.buffer, peer_id, cx);
+                lsp_store
+                    .buffer_store()
+                    .update(cx, |buffer_store, cx| {
+                        buffer_store.create_buffer_for_peer(&definition.buffer, peer_id, cx)
+                    })
+                    .detach_and_log_err(cx);
+                let buffer_id = definition.buffer.read(cx).remote_id();
                 proto::Location {
                     start: Some(serialize_anchor(&definition.range.start)),
                     end: Some(serialize_anchor(&definition.range.end)),
@@ -1052,7 +1175,7 @@ impl LspCommand for GetReferences {
     async fn response_from_proto(
         self,
         message: proto::GetReferencesResponse,
-        project: Model<Project>,
+        project: Model<LspStore>,
         _: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Vec<Location>> {
@@ -1123,7 +1246,7 @@ impl LspCommand for GetDocumentHighlights {
     async fn response_from_lsp(
         self,
         lsp_highlights: Option<Vec<lsp::DocumentHighlight>>,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         _: LanguageServerId,
         mut cx: AsyncAppContext,
@@ -1162,7 +1285,7 @@ impl LspCommand for GetDocumentHighlights {
 
     async fn from_proto(
         message: proto::GetDocumentHighlights,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -1182,7 +1305,7 @@ impl LspCommand for GetDocumentHighlights {
 
     fn response_to_proto(
         response: Vec<DocumentHighlight>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         _: &clock::Global,
         _: &mut AppContext,
@@ -1206,7 +1329,7 @@ impl LspCommand for GetDocumentHighlights {
     async fn response_from_proto(
         self,
         message: proto::GetDocumentHighlightsResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Vec<DocumentHighlight>> {
@@ -1282,7 +1405,7 @@ impl LspCommand for GetSignatureHelp {
     async fn response_from_lsp(
         self,
         message: Option<lsp::SignatureHelp>,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         _: LanguageServerId,
         mut cx: AsyncAppContext,
@@ -1303,7 +1426,7 @@ impl LspCommand for GetSignatureHelp {
 
     async fn from_proto(
         payload: Self::ProtoRequest,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -1325,7 +1448,7 @@ impl LspCommand for GetSignatureHelp {
 
     fn response_to_proto(
         response: Self::Response,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         _: &Global,
         _: &mut AppContext,
@@ -1339,7 +1462,7 @@ impl LspCommand for GetSignatureHelp {
     async fn response_from_proto(
         self,
         response: proto::GetSignatureHelpResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self::Response> {
@@ -1390,7 +1513,7 @@ impl LspCommand for GetHover {
     async fn response_from_lsp(
         self,
         message: Option<lsp::Hover>,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         _: LanguageServerId,
         mut cx: AsyncAppContext,
@@ -1471,7 +1594,7 @@ impl LspCommand for GetHover {
 
     async fn from_proto(
         message: Self::ProtoRequest,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -1491,7 +1614,7 @@ impl LspCommand for GetHover {
 
     fn response_to_proto(
         response: Self::Response,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         _: &clock::Global,
         _: &mut AppContext,
@@ -1537,7 +1660,7 @@ impl LspCommand for GetHover {
     async fn response_from_proto(
         self,
         message: proto::GetHoverResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self::Response> {
@@ -1613,7 +1736,7 @@ impl LspCommand for GetCompletions {
     async fn response_from_lsp(
         self,
         completions: Option<lsp::CompletionResponse>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         mut cx: AsyncAppContext,
@@ -1633,9 +1756,9 @@ impl LspCommand for GetCompletions {
             Default::default()
         };
 
-        let language_server_adapter = project
-            .update(&mut cx, |project, _cx| {
-                project.language_server_adapter_for_id(server_id)
+        let language_server_adapter = lsp_store
+            .update(&mut cx, |lsp_store, _| {
+                lsp_store.language_server_adapter_for_id(server_id)
             })?
             .ok_or_else(|| anyhow!("no such language server"))?;
 
@@ -1772,7 +1895,7 @@ impl LspCommand for GetCompletions {
 
     async fn from_proto(
         message: proto::GetCompletions,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -1800,7 +1923,7 @@ impl LspCommand for GetCompletions {
 
     fn response_to_proto(
         completions: Vec<CoreCompletion>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         buffer_version: &clock::Global,
         _: &mut AppContext,
@@ -1808,7 +1931,7 @@ impl LspCommand for GetCompletions {
         proto::GetCompletionsResponse {
             completions: completions
                 .iter()
-                .map(Project::serialize_completion)
+                .map(LspStore::serialize_completion)
                 .collect(),
             version: serialize_version(buffer_version),
         }
@@ -1817,7 +1940,7 @@ impl LspCommand for GetCompletions {
     async fn response_from_proto(
         self,
         message: proto::GetCompletionsResponse,
-        _project: Model<Project>,
+        _project: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self::Response> {
@@ -1830,7 +1953,7 @@ impl LspCommand for GetCompletions {
         message
             .completions
             .into_iter()
-            .map(Project::deserialize_completion)
+            .map(LspStore::deserialize_completion)
             .collect()
     }
 
@@ -1956,7 +2079,7 @@ impl LspCommand for GetCodeActions {
     async fn response_from_lsp(
         self,
         actions: Option<lsp::CodeActionResponse>,
-        _: Model<Project>,
+        _: Model<LspStore>,
         _: Model<Buffer>,
         server_id: LanguageServerId,
         _: AsyncAppContext,
@@ -1990,7 +2113,7 @@ impl LspCommand for GetCodeActions {
 
     async fn from_proto(
         message: proto::GetCodeActions,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -2016,7 +2139,7 @@ impl LspCommand for GetCodeActions {
 
     fn response_to_proto(
         code_actions: Vec<CodeAction>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         buffer_version: &clock::Global,
         _: &mut AppContext,
@@ -2024,7 +2147,7 @@ impl LspCommand for GetCodeActions {
         proto::GetCodeActionsResponse {
             actions: code_actions
                 .iter()
-                .map(Project::serialize_code_action)
+                .map(LspStore::serialize_code_action)
                 .collect(),
             version: serialize_version(buffer_version),
         }
@@ -2033,7 +2156,7 @@ impl LspCommand for GetCodeActions {
     async fn response_from_proto(
         self,
         message: proto::GetCodeActionsResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Vec<CodeAction>> {
@@ -2045,7 +2168,7 @@ impl LspCommand for GetCodeActions {
         message
             .actions
             .into_iter()
-            .map(Project::deserialize_code_action)
+            .map(LspStore::deserialize_code_action)
             .collect()
     }
 
@@ -2122,16 +2245,16 @@ impl LspCommand for OnTypeFormatting {
     async fn response_from_lsp(
         self,
         message: Option<Vec<lsp::TextEdit>>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         mut cx: AsyncAppContext,
     ) -> Result<Option<Transaction>> {
         if let Some(edits) = message {
             let (lsp_adapter, lsp_server) =
-                language_server_for_buffer(&project, &buffer, server_id, &mut cx)?;
-            Project::deserialize_edits(
-                project,
+                language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
+            LspStore::deserialize_text_edits(
+                lsp_store,
                 buffer,
                 edits,
                 self.push_to_history,
@@ -2159,7 +2282,7 @@ impl LspCommand for OnTypeFormatting {
 
     async fn from_proto(
         message: proto::OnTypeFormatting,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -2187,7 +2310,7 @@ impl LspCommand for OnTypeFormatting {
 
     fn response_to_proto(
         response: Option<Transaction>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         _: &clock::Global,
         _: &mut AppContext,
@@ -2201,7 +2324,7 @@ impl LspCommand for OnTypeFormatting {
     async fn response_from_proto(
         self,
         message: proto::OnTypeFormattingResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         _: Model<Buffer>,
         _: AsyncAppContext,
     ) -> Result<Option<Transaction>> {
@@ -2625,13 +2748,13 @@ impl LspCommand for InlayHints {
     async fn response_from_lsp(
         self,
         message: Option<Vec<lsp::InlayHint>>,
-        project: Model<Project>,
+        lsp_store: Model<LspStore>,
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         mut cx: AsyncAppContext,
     ) -> anyhow::Result<Vec<InlayHint>> {
         let (lsp_adapter, lsp_server) =
-            language_server_for_buffer(&project, &buffer, server_id, &mut cx)?;
+            language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
         // `typescript-language-server` adds padding to the left for type hints, turning
         // `const foo: boolean` into `const foo : boolean` which looks odd.
         // `rust-analyzer` does not have the padding for this case, and we have to accommodate both.
@@ -2681,7 +2804,7 @@ impl LspCommand for InlayHints {
 
     async fn from_proto(
         message: proto::InlayHints,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -2704,7 +2827,7 @@ impl LspCommand for InlayHints {
 
     fn response_to_proto(
         response: Vec<InlayHint>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         buffer_version: &clock::Global,
         _: &mut AppContext,
@@ -2721,7 +2844,7 @@ impl LspCommand for InlayHints {
     async fn response_from_proto(
         self,
         message: proto::InlayHintsResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> anyhow::Result<Vec<InlayHint>> {
@@ -2783,7 +2906,7 @@ impl LspCommand for LinkedEditingRange {
     async fn response_from_lsp(
         self,
         message: Option<lsp::LinkedEditingRanges>,
-        _project: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         _server_id: LanguageServerId,
         cx: AsyncAppContext,
@@ -2819,7 +2942,7 @@ impl LspCommand for LinkedEditingRange {
 
     async fn from_proto(
         message: proto::LinkedEditingRange,
-        _project: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Self> {
@@ -2840,7 +2963,7 @@ impl LspCommand for LinkedEditingRange {
 
     fn response_to_proto(
         response: Vec<Range<Anchor>>,
-        _: &mut Project,
+        _: &mut LspStore,
         _: PeerId,
         buffer_version: &clock::Global,
         _: &mut AppContext,
@@ -2860,7 +2983,7 @@ impl LspCommand for LinkedEditingRange {
     async fn response_from_proto(
         self,
         message: proto::LinkedEditingRangeResponse,
-        _: Model<Project>,
+        _: Model<LspStore>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
     ) -> Result<Vec<Range<Anchor>>> {

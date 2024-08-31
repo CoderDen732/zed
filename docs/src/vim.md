@@ -17,8 +17,10 @@ Vim mode has several "core Zed" key bindings, that will help you make the most o
 ```
 # Language server
 g d     Go to definition
-g D     Go to type definition
-g cmd-d Go to implementation
+g D     Go to declaration
+g y     Go to type definition
+g I     Go to implementation
+
 c d     Rename (change definition)
 g A     Go to All references to the current word
 
@@ -55,7 +57,6 @@ g <space>  Open the current search excerpt
 <ctrl-w> g D      Go to type definition in a split
 
 # Insert mode
-i a / a a      Select the function argument the cursor is in
 ctrl-x ctrl-o  Open the completion menu
 ctrl-x ctrl-c  Request GitHub Copilot suggestion (if configured)
 ctrl-x ctrl-a  Open the inline AI assistant (if configured)
@@ -114,7 +115,7 @@ For vim-specific shortcuts, you may find the following template a good place to 
 ]
 ```
 
-If you would like to emulate vim's `map` (`nmap` etc.) commands you can bind to the [`workspace::SendKeystrokes`](/docs/key-bindings#remapping-keys) action in the correct context.
+If you would like to emulate vim's `map` (`nmap` etc.) commands you can bind to the [`workspace::SendKeystrokes`](./key-bindings.md#remapping-keys) action in the correct context.
 
 You can see the bindings that are enabled by default in vim mode [here](https://github.com/zed-industries/zed/blob/main/assets/keymaps/vim.json).
 
@@ -133,7 +134,7 @@ Vim mode adds several contexts to the `Editor`:
 If you're using Vim mode on Linux or Windows, you may find that it has overridden keybindings
 that you can't live without. You can restore them to their defaults by copying these into your keymap:
 
-```
+```json
 {
   "context": "Editor && !menu",
   "bindings": {
@@ -240,8 +241,17 @@ Some vim settings are available to modify the default vim behavior:
     // "never": don't use system clipboard unless "+ or "* is specified
     // "on_yank": use system clipboard for yank operations when no register is specified
     "use_system_clipboard": "always",
-    // Lets `f` and `t` motions extend across multiple lines
-    "use_multiline_find": true
+    // Let `f` and `t` motions extend across multiple lines
+    "use_multiline_find": true,
+    // Let `f` and `t` motions match case insensitively if the target is lowercase
+    "use_smartcase_find": true,
+    // Use relative line numbers in normal mode, absolute in insert mode
+    // c.f. https://github.com/jeffkreeftmeijer/vim-numbertoggle
+    "toggle_relative_line_numbers": true,
+    // Add custom digraphs (e.g. ctrl-k f z will insert a zombie emoji)
+    "custom_digraphs": {
+      "fz": "🧟‍♀️"
+    }
   }
 }
 ```
@@ -256,6 +266,8 @@ There are also a few Zed settings that you may also enjoy if you use vim mode:
   "relative_line_numbers": true,
   // hide the scroll bar
   "scrollbar": { "show": "never" },
+  // prevent the buffer from scrolling beyond the last line
+  "scroll_beyond_last_line": "off",
   // allow cursor to reach edges of screen
   "vertical_scroll_margin": 0,
   "gutter": {
@@ -288,15 +300,17 @@ If you want to navigate between the editor and docks (terminal, project panel, A
 Subword motion is not enabled by default. To enable it, add these bindings to your keymap.
 
 ```json
+[
   {
-    "context": "VimControl && !menu",
+    "context": "VimControl && !menu && vim_mode != operator",
     "bindings": {
       "w": "vim::NextSubwordStart",
       "b": "vim::PreviousSubwordStart",
       "e": "vim::NextSubwordEnd",
       "g e": "vim::PreviousSubwordEnd"
     }
-  },
+  }
+]
 ```
 
 Surrounding the selection in visual mode is also not enabled by default (`shift-s` normally behaves like `c`). To enable it, add the following to your keymap.
