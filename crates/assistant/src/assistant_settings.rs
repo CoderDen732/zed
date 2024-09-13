@@ -160,10 +160,12 @@ impl AssistantSettingsContent {
                                             .filter_map(|model| match model {
                                                 OpenAiModel::Custom {
                                                     name,
+                                                    display_name,
                                                     max_tokens,
                                                     max_output_tokens,
                                                 } => Some(open_ai::AvailableModel {
                                                     name,
+                                                    display_name,
                                                     max_tokens,
                                                     max_output_tokens,
                                                 }),
@@ -517,6 +519,7 @@ impl Settings for AssistantSettings {
                 &mut settings.default_model,
                 value.default_model.map(Into::into),
             );
+            // merge(&mut settings.infer_context, value.infer_context); TODO re-enable this once we ship context inference
         }
 
         Ok(settings)
