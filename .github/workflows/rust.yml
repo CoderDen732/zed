@@ -13,7 +13,7 @@ env:
 jobs:
   build:
 
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
     - name: Enable Long File Paths
@@ -22,10 +22,11 @@ jobs:
       uses: actions/checkout@v4
     - name: Build
       run: |
+          rustup target add x86_64-pc-windows-msvc
           rustup target add wasm32-wasip1
-          cargo build --release 
+          cargo build --release --target x86_64-pc-windows-msvc
     - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: zed-windows
         path: ${{ github.workspace }}/target/release 
