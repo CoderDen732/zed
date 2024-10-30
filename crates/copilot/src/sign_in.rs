@@ -1,10 +1,10 @@
 use crate::{request::PromptUserDeviceFlow, Copilot, Status};
 use gpui::{
-    div, svg, AppContext, ClipboardItem, DismissEvent, Element, EventEmitter, FocusHandle,
+    div, AppContext, ClipboardItem, DismissEvent, Element, EventEmitter, FocusHandle,
     FocusableView, InteractiveElement, IntoElement, Model, MouseDownEvent, ParentElement, Render,
     Styled, Subscription, ViewContext,
 };
-use ui::{prelude::*, Button, IconName, Label};
+use ui::{prelude::*, Button, Label, Vector, VectorName};
 use workspace::ModalView;
 
 const COPILOT_SIGN_UP_URL: &str = "https://github.com/features/copilot";
@@ -185,7 +185,7 @@ impl Render for CopilotCodeVerification {
 
         v_flex()
             .id("copilot code verification")
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle(cx))
             .elevation_3(cx)
             .w_96()
             .items_center()
@@ -198,12 +198,8 @@ impl Render for CopilotCodeVerification {
                 cx.focus(&this.focus_handle);
             }))
             .child(
-                svg()
-                    .w_32()
-                    .h_16()
-                    .flex_none()
-                    .path(IconName::ZedXCopilot.path())
-                    .text_color(cx.theme().colors().icon),
+                Vector::new(VectorName::ZedXCopilot, rems(8.), rems(4.))
+                    .color(Color::Custom(cx.theme().colors().icon)),
             )
             .child(prompt)
     }
