@@ -4,7 +4,7 @@ use futures::StreamExt;
 use gpui::AsyncAppContext;
 use http_client::github::{latest_github_release, GitHubLspBinaryVersion};
 pub use language::*;
-use lsp::LanguageServerBinary;
+use lsp::{LanguageServerBinary, LanguageServerName};
 use smol::fs::{self, File};
 use std::{any::Any, env::consts, path::PathBuf, sync::Arc};
 use util::{fs::remove_matching, maybe, ResultExt};
@@ -85,7 +85,7 @@ impl super::LspAdapter for CLspAdapter {
             }
             futures::io::copy(response.body_mut(), &mut file).await?;
 
-            let unzip_status = smol::process::Command::new("unzip")
+            let unzip_status = util::command::new_smol_command("unzip")
                 .current_dir(&container_dir)
                 .arg(&zip_path)
                 .output()

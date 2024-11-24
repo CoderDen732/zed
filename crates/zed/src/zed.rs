@@ -1,14 +1,18 @@
 mod app_menus;
+pub mod assistant_hints;
 pub mod inline_completion_registry;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) mod linux_prompts;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod open_listener;
+mod quick_action_bar;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
+use anyhow::Context as _;
 pub use app_menus::*;
+use assets::Assets;
 use assistant::PromptBuilder;
 use breadcrumbs::Breadcrumbs;
 use client::{zed_urls, ZED_URL_SCHEME};
@@ -17,17 +21,15 @@ use command_palette_hooks::CommandPaletteFilter;
 use editor::ProposedChangesEditorToolbar;
 use editor::{scroll::Autoscroll, Editor, MultiBuffer};
 use feature_flags::FeatureFlagAppExt;
+use futures::{channel::mpsc, select_biased, StreamExt};
 use gpui::{
     actions, point, px, AppContext, AsyncAppContext, Context, FocusableView, MenuItem,
     PathPromptOptions, PromptLevel, ReadGlobal, Task, TitlebarOptions, View, ViewContext,
     VisualContext, WindowKind, WindowOptions,
 };
 pub use open_listener::*;
-
-use anyhow::Context as _;
-use assets::Assets;
-use futures::{channel::mpsc, select_biased, StreamExt};
 use outline_panel::OutlinePanel;
+use paths::{local_settings_file_relative_path, local_tasks_file_relative_path};
 use project::{DirectoryLister, Item};
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
@@ -42,16 +44,14 @@ use settings::{
 use std::any::TypeId;
 use std::path::PathBuf;
 use std::{borrow::Cow, ops::Deref, path::Path, sync::Arc};
-use theme::ActiveTheme;
-use workspace::notifications::NotificationId;
-use workspace::CloseIntent;
-
-use paths::{local_settings_file_relative_path, local_tasks_file_relative_path};
 use terminal_view::terminal_panel::{self, TerminalPanel};
+use theme::ActiveTheme;
 use util::{asset_str, ResultExt};
 use uuid::Uuid;
-use vim::VimModeSetting;
+use vim_mode_setting::VimModeSetting;
 use welcome::{BaseKeymap, MultibufferHint};
+use workspace::notifications::NotificationId;
+use workspace::CloseIntent;
 use workspace::{
     create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
     open_new, AppState, NewFile, NewWindow, OpenLog, Toast, Workspace, WorkspaceSettings,
@@ -68,7 +68,6 @@ actions!(
         Hide,
         HideOthers,
         Minimize,
-        OpenDefaultKeymap,
         OpenDefaultSettings,
         OpenProjectSettings,
         OpenProjectTasks,
@@ -154,8 +153,8 @@ pub fn initialize_workspace(
         })
         .detach();
 
-        #[cfg(target_os = "linux")]
-        if let Err(e) = fs::watcher::global(|_| {}) {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Err(e) = fs::linux_watcher::global(|_| {}) {
             let message = format!(db::indoc!{r#"
                 inotify_init returned {}
 
@@ -223,7 +222,7 @@ pub fn initialize_workspace(
             status_bar.add_right_item(cursor_position, cx);
         });
 
-        auto_update::notify_of_any_new_update(cx);
+        auto_update_ui::notify_of_any_new_update(cx);
 
         let handle = cx.view().downgrade();
         cx.on_window_should_close(move |cx| {
@@ -237,10 +236,29 @@ pub fn initialize_workspace(
                 .unwrap_or(true)
         });
 
+        let release_channel = ReleaseChannel::global(cx);
+        let assistant2_feature_flag = cx.wait_for_flag::<feature_flags::Assistant2FeatureFlag>();
+
         let prompt_builder = prompt_builder.clone();
         cx.spawn(|workspace_handle, mut cx| async move {
-            let assistant_panel =
-                assistant::AssistantPanel::load(workspace_handle.clone(), prompt_builder, cx.clone());
+            let is_assistant2_enabled = if cfg!(test) {
+                false
+            } else {
+                let is_assistant2_feature_flag_enabled = assistant2_feature_flag.await;
+                release_channel == ReleaseChannel::Dev && is_assistant2_feature_flag_enabled
+            };
+
+            let (assistant_panel, assistant2_panel) = if is_assistant2_enabled {
+                let assistant2_panel =
+                    assistant2::AssistantPanel::load(workspace_handle.clone(), cx.clone()).await?;
+
+                (None, Some(assistant2_panel))
+            } else {
+                let assistant_panel =
+                    assistant::AssistantPanel::load(workspace_handle.clone(), prompt_builder, cx.clone()).await?;
+
+                (Some(assistant_panel), None)
+            };
 
             let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
             let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
@@ -258,7 +276,6 @@ pub fn initialize_workspace(
                 project_panel,
                 outline_panel,
                 terminal_panel,
-                assistant_panel,
                 channels_panel,
                 chat_panel,
                 notification_panel,
@@ -266,14 +283,20 @@ pub fn initialize_workspace(
                 project_panel,
                 outline_panel,
                 terminal_panel,
-                assistant_panel,
                 channels_panel,
                 chat_panel,
                 notification_panel,
             )?;
 
             workspace_handle.update(&mut cx, |workspace, cx| {
-                workspace.add_panel(assistant_panel, cx);
+                if let Some(assistant_panel) = assistant_panel {
+                    workspace.add_panel(assistant_panel, cx);
+                }
+
+                if let Some(assistant2_panel) = assistant2_panel {
+                    workspace.add_panel(assistant2_panel, cx);
+                }
+
                 workspace.add_panel(project_panel, cx);
                 workspace.add_panel(outline_panel, cx);
                 workspace.add_panel(terminal_panel, cx);
@@ -362,7 +385,7 @@ pub fn initialize_workspace(
             })
             .register_action(|_, _: &install_cli::Install, cx| {
                 cx.spawn(|workspace, mut cx| async move {
-                    if cfg!(target_os = "linux") {
+                    if cfg!(any(target_os = "linux", target_os = "freebsd")) {
                         let prompt = cx.prompt(
                             PromptLevel::Warning,
                             "CLI should already be installed",
@@ -474,7 +497,7 @@ pub fn initialize_workspace(
             .register_action(open_project_tasks_file)
             .register_action(
                 move |workspace: &mut Workspace,
-                      _: &OpenDefaultKeymap,
+                      _: &zed_actions::OpenDefaultKeymap,
                       cx: &mut ViewContext<Workspace>| {
                     open_bundled_file(
                         workspace,
@@ -809,6 +832,7 @@ pub fn handle_keymap_file_changes(
     VimModeSetting::register(cx);
 
     let (base_keymap_tx, mut base_keymap_rx) = mpsc::unbounded();
+    let (keyboard_layout_tx, mut keyboard_layout_rx) = mpsc::unbounded();
     let mut old_base_keymap = *BaseKeymap::get_global(cx);
     let mut old_vim_enabled = VimModeSetting::get_global(cx).0;
     cx.observe_global::<SettingsStore>(move |cx| {
@@ -823,6 +847,16 @@ pub fn handle_keymap_file_changes(
     })
     .detach();
 
+    let mut current_mapping = settings::get_key_equivalents(cx.keyboard_layout());
+    cx.on_keyboard_layout_change(move |cx| {
+        let next_mapping = settings::get_key_equivalents(cx.keyboard_layout());
+        if next_mapping != current_mapping {
+            current_mapping = next_mapping;
+            keyboard_layout_tx.unbounded_send(()).ok();
+        }
+    })
+    .detach();
+
     load_default_keymap(cx);
 
     cx.spawn(move |cx| async move {
@@ -830,6 +864,7 @@ pub fn handle_keymap_file_changes(
         loop {
             select_biased! {
                 _ = base_keymap_rx.next() => {}
+                _ = keyboard_layout_rx.next() => {}
                 user_keymap_content = user_keymap_file_rx.next() => {
                     if let Some(user_keymap_content) = user_keymap_content {
                         match KeymapFile::parse(&user_keymap_content) {
@@ -855,7 +890,7 @@ fn reload_keymaps(cx: &mut AppContext, keymap_content: &KeymapFile) {
     load_default_keymap(cx);
     keymap_content.clone().add_to_cx(cx).log_err();
     cx.set_menus(app_menus());
-    cx.set_dock_menu(vec![MenuItem::action("New Window", workspace::NewWindow)])
+    cx.set_dock_menu(vec![MenuItem::action("New Window", workspace::NewWindow)]);
 }
 
 pub fn load_default_keymap(cx: &mut AppContext) {
@@ -1000,7 +1035,7 @@ fn open_telemetry_log_file(workspace: &mut Workspace, cx: &mut ViewContext<Works
         let app_state = workspace.app_state().clone();
         cx.spawn(|workspace, mut cx| async move {
             async fn fetch_log_string(app_state: &Arc<AppState>) -> Option<String> {
-                let path = app_state.client.telemetry().log_file_path()?;
+                let path = client::telemetry::Telemetry::log_file_path();
                 app_state.fs.load(&path).await.log_err()
             }
 
@@ -3425,7 +3460,7 @@ mod tests {
         theme::init(theme::LoadThemes::JustBase, cx);
 
         let mut has_default_theme = false;
-        for theme_name in themes.list(false).into_iter().map(|meta| meta.name) {
+        for theme_name in themes.list().into_iter().map(|meta| meta.name) {
             let theme = themes.get(&theme_name).unwrap();
             assert_eq!(theme.name, theme_name);
             if theme.name == ThemeSettings::get(None, cx).active_theme.name {
@@ -3492,7 +3527,8 @@ mod tests {
                 app_state.client.http_client().clone(),
                 cx,
             );
-            language_model::init(
+            language_model::init(cx);
+            language_models::init(
                 app_state.user_store.clone(),
                 app_state.client.clone(),
                 app_state.fs.clone(),

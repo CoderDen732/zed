@@ -109,7 +109,7 @@ pub struct TerminalView {
     blink_epoch: usize,
     can_navigate_to_selected_word: bool,
     workspace_id: Option<WorkspaceId>,
-    show_title: bool,
+    show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
     scroll_top: Pixels,
     _subscriptions: Vec<Subscription>,
@@ -189,7 +189,7 @@ impl TerminalView {
             blink_epoch: 0,
             can_navigate_to_selected_word: false,
             workspace_id,
-            show_title: TerminalSettings::get_global(cx).toolbar.title,
+            show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             _subscriptions: vec![
@@ -259,7 +259,7 @@ impl TerminalView {
 
     fn settings_changed(&mut self, cx: &mut ViewContext<Self>) {
         let settings = TerminalSettings::get_global(cx);
-        self.show_title = settings.toolbar.title;
+        self.show_breadcrumbs = settings.toolbar.breadcrumbs;
 
         let new_cursor_shape = settings.cursor_shape.unwrap_or_default();
         let old_cursor_shape = self.cursor_shape;
@@ -1044,16 +1044,22 @@ impl Item for TerminalView {
                 .shape(ui::IconButtonShape::Square)
                 .tooltip(|cx| Tooltip::text("Rerun task", cx))
                 .on_click(move |_, cx| {
-                    cx.dispatch_action(Box::new(tasks_ui::Rerun {
-                        task_id: Some(task_id.clone()),
-                        ..tasks_ui::Rerun::default()
+                    cx.dispatch_action(Box::new(zed_actions::Rerun {
+                        task_id: Some(task_id.0.clone()),
+                        allow_concurrent_runs: Some(true),
+                        use_new_terminal: Some(false),
+                        reevaluate_context: false,
                     }));
                 })
         };
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task) => match &terminal_task.status {
-                TaskStatus::Running => (IconName::Play, Color::Disabled, None),
+                TaskStatus::Running => (
+                    IconName::Play,
+                    Color::Disabled,
+                    Some(rerun_button(terminal_task.id.clone())),
+                ),
                 TaskStatus::Unknown => (
                     IconName::Warning,
                     Color::Warning,
@@ -1131,12 +1137,16 @@ impl Item for TerminalView {
         false
     }
 
+    fn is_singleton(&self, _cx: &AppContext) -> bool {
+        true
+    }
+
     fn as_searchable(&self, handle: &View<Self>) -> Option<Box<dyn SearchableItemHandle>> {
         Some(Box::new(handle.clone()))
     }
 
-    fn breadcrumb_location(&self) -> ToolbarItemLocation {
-        if self.show_title {
+    fn breadcrumb_location(&self, cx: &AppContext) -> ToolbarItemLocation {
+        if self.show_breadcrumbs && !self.terminal().read(cx).breadcrumb_text.trim().is_empty() {
             ToolbarItemLocation::PrimaryLeft
         } else {
             ToolbarItemLocation::Hidden
@@ -1461,7 +1471,7 @@ mod tests {
         });
     }
 
-    // Active entry with a work tree, worktree is a file -> home_dir()
+    // Active entry with a work tree, worktree is a file -> worktree_folder()
     #[gpui::test]
     async fn active_entry_worktree_is_file(cx: &mut TestAppContext) {
         let (project, workspace) = init_test(cx).await;
@@ -1477,7 +1487,7 @@ mod tests {
             assert!(active_entry.is_some());
 
             let res = default_working_directory(workspace, cx);
-            assert_eq!(res, None);
+            assert_eq!(res, Some((Path::new("/root1/")).to_path_buf()));
             let res = first_project_directory(workspace, cx);
             assert_eq!(res, Some((Path::new("/root1/")).to_path_buf()));
         });

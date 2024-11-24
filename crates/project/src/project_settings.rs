@@ -2,7 +2,7 @@ use anyhow::Context;
 use collections::HashMap;
 use fs::Fs;
 use gpui::{AppContext, AsyncAppContext, BorrowAppContext, EventEmitter, Model, ModelContext};
-use language::LanguageServerName;
+use lsp::LanguageServerName;
 use paths::{
     local_settings_file_relative_path, local_tasks_file_relative_path,
     local_vscode_tasks_file_relative_path, EDITORCONFIG_NAME,
@@ -161,8 +161,9 @@ pub struct InlineBlameSettings {
 const fn true_value() -> bool {
     true
 }
+
 const fn false_value() -> bool {
-    true
+    false
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

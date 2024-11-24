@@ -114,7 +114,7 @@ impl Cell {
                 id,
                 metadata,
                 source,
-                attachments: _,
+                ..
             } => {
                 let source = source.join("");
 
@@ -260,7 +260,7 @@ pub trait RenderableCell: Render {
         if (cell_position == Some(&CellPosition::First) && is_first)
             || (cell_position == Some(&CellPosition::Last) && !is_first)
         {
-            Some(div().flex().w_full().h(Spacing::XLarge.px(cx)))
+            Some(div().flex().w_full().h(DynamicSpacing::Base12.px(cx)))
         } else {
             None
         }
@@ -389,7 +389,7 @@ impl Render for MarkdownCell {
                     .pr_6()
                     .rounded_sm()
                     .items_start()
-                    .gap(Spacing::Large.rems(cx))
+                    .gap(DynamicSpacing::Base08.rems(cx))
                     .bg(self.selected_bg_color(cx))
                     .child(self.gutter(cx))
                     .child(
@@ -553,9 +553,6 @@ impl RunnableCell for CodeCell {
 
 impl Render for CodeCell {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let lines = self.source.lines().count();
-        let height = lines as f32 * cx.line_height();
-
         v_flex()
             .size_full()
             // TODO: Move base cell render into trait impl so we don't have to repeat this
@@ -567,7 +564,7 @@ impl Render for CodeCell {
                     .pr_6()
                     .rounded_sm()
                     .items_start()
-                    .gap(Spacing::Large.rems(cx))
+                    .gap(DynamicSpacing::Base08.rems(cx))
                     .bg(self.selected_bg_color(cx))
                     .child(self.gutter(cx))
                     .child(
@@ -582,7 +579,7 @@ impl Render for CodeCell {
                                 .border_1()
                                 .border_color(cx.theme().colors().border)
                                 .bg(cx.theme().colors().editor_background)
-                                .child(div().h(height).w_full().child(self.editor.clone())),
+                                .child(div().w_full().child(self.editor.clone())),
                         ),
                     ),
             )
@@ -593,7 +590,7 @@ impl Render for CodeCell {
                     .pr_6()
                     .rounded_sm()
                     .items_start()
-                    .gap(Spacing::Large.rems(cx))
+                    .gap(DynamicSpacing::Base08.rems(cx))
                     .bg(self.selected_bg_color(cx))
                     .child(self.gutter_output(cx))
                     .child(
@@ -713,7 +710,7 @@ impl Render for RawCell {
                     .pr_2()
                     .rounded_sm()
                     .items_start()
-                    .gap(Spacing::Large.rems(cx))
+                    .gap(DynamicSpacing::Base08.rems(cx))
                     .bg(self.selected_bg_color(cx))
                     .child(self.gutter(cx))
                     .child(

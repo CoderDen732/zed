@@ -197,6 +197,14 @@ impl Platform for WindowsPlatform {
         self.text_system.clone()
     }
 
+    fn keyboard_layout(&self) -> String {
+        "unknown".into()
+    }
+
+    fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {
+        // todo(windows)
+    }
+
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
         on_finish_launching();
         let vsync_event = unsafe { Owned::new(CreateEventW(None, false, false, None).unwrap()) };
@@ -284,7 +292,7 @@ impl Platform for WindowsPlatform {
             pid,
             app_path.display(),
         );
-        let restart_process = std::process::Command::new("powershell.exe")
+        let restart_process = util::command::new_std_command("powershell.exe")
             .arg("-command")
             .arg(script)
             .spawn();

@@ -1,6 +1,7 @@
 use std::{ops::ControlFlow, path::PathBuf, sync::Arc};
 
 use crate::{default_working_directory, TerminalView};
+use breadcrumbs::Breadcrumbs;
 use collections::{HashMap, HashSet};
 use db::kvp::KEY_VALUE_STORE;
 use futures::future::join_all;
@@ -138,8 +139,11 @@ impl TerminalPanel {
                 ControlFlow::Break(())
             });
             let buffer_search_bar = cx.new_view(search::BufferSearchBar::new);
-            pane.toolbar()
-                .update(cx, |toolbar, cx| toolbar.add_item(buffer_search_bar, cx));
+            let breadcrumbs = cx.new_view(|_| Breadcrumbs::new());
+            pane.toolbar().update(cx, |toolbar, cx| {
+                toolbar.add_item(buffer_search_bar, cx);
+                toolbar.add_item(breadcrumbs, cx);
+            });
             pane
         });
         let subscriptions = vec![
@@ -218,7 +222,7 @@ impl TerminalPanel {
                                         // context menu will be gone the moment we spawn the modal.
                                         .action(
                                             "Spawn task",
-                                            tasks_ui::Spawn::modal().boxed_clone(),
+                                            zed_actions::Spawn::modal().boxed_clone(),
                                         )
                                 });
 
@@ -575,9 +579,9 @@ impl TerminalPanel {
             .collect()
     }
 
-    fn activate_terminal_view(&self, item_index: usize, cx: &mut WindowContext) {
+    fn activate_terminal_view(&self, item_index: usize, focus: bool, cx: &mut WindowContext) {
         self.pane.update(cx, |pane, cx| {
-            pane.activate_item(item_index, true, true, cx)
+            pane.activate_item(item_index, true, focus, cx)
         })
     }
 
@@ -616,8 +620,14 @@ impl TerminalPanel {
                     pane.add_item(terminal_view, true, focus, None, cx);
                 });
 
-                if reveal_strategy == RevealStrategy::Always {
-                    workspace.focus_panel::<Self>(cx);
+                match reveal_strategy {
+                    RevealStrategy::Always => {
+                        workspace.focus_panel::<Self>(cx);
+                    }
+                    RevealStrategy::NoFocus => {
+                        workspace.open_panel::<Self>(cx);
+                    }
+                    RevealStrategy::Never => {}
                 }
                 Ok(terminal)
             })?;
@@ -698,11 +708,21 @@ impl TerminalPanel {
 
         match reveal {
             RevealStrategy::Always => {
-                self.activate_terminal_view(terminal_item_index, cx);
+                self.activate_terminal_view(terminal_item_index, true, cx);
                 let task_workspace = self.workspace.clone();
                 cx.spawn(|_, mut cx| async move {
                     task_workspace
                         .update(&mut cx, |workspace, cx| workspace.focus_panel::<Self>(cx))
+                        .ok()
+                })
+                .detach();
+            }
+            RevealStrategy::NoFocus => {
+                self.activate_terminal_view(terminal_item_index, false, cx);
+                let task_workspace = self.workspace.clone();
+                cx.spawn(|_, mut cx| async move {
+                    task_workspace
+                        .update(&mut cx, |workspace, cx| workspace.open_panel::<Self>(cx))
                         .ok()
                 })
                 .detach();
