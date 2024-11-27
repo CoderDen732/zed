@@ -20,6 +20,8 @@ jobs:
       run: git config --global core.longpaths true
     - name: Checkout Code
       uses: actions/checkout@v4
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
     - name: Build
       run: |
           rustup toolchain install stable --profile minimal --no-self-update
