@@ -71,8 +71,8 @@ impl Markdown {
         source: String,
         style: MarkdownStyle,
         language_registry: Option<Arc<LanguageRegistry>>,
-        cx: &ViewContext<Self>,
         fallback_code_block_language: Option<String>,
+        cx: &ViewContext<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let mut this = Self {
@@ -97,8 +97,8 @@ impl Markdown {
         source: String,
         style: MarkdownStyle,
         language_registry: Option<Arc<LanguageRegistry>>,
-        cx: &ViewContext<Self>,
         fallback_code_block_language: Option<String>,
+        cx: &ViewContext<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let mut this = Self {
@@ -614,11 +614,11 @@ impl Element for MarkdownElement {
                             };
                             builder.push_div(
                                 div()
+                                    .mb_1()
                                     .h_flex()
-                                    .mb_2()
-                                    .line_height(rems(1.3))
                                     .items_start()
                                     .gap_1()
+                                    .line_height(rems(1.3))
                                     .child(bullet),
                                 range,
                                 markdown_end,

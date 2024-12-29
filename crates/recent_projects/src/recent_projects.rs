@@ -172,13 +172,13 @@ impl PickerDelegate for RecentProjectsDelegate {
     fn placeholder_text(&self, cx: &mut WindowContext) -> Arc<str> {
         let (create_window, reuse_window) = if self.create_new_window {
             (
-                cx.keystroke_text_for_action(&menu::Confirm),
-                cx.keystroke_text_for_action(&menu::SecondaryConfirm),
+                cx.keystroke_text_for(&menu::Confirm),
+                cx.keystroke_text_for(&menu::SecondaryConfirm),
             )
         } else {
             (
-                cx.keystroke_text_for_action(&menu::SecondaryConfirm),
-                cx.keystroke_text_for_action(&menu::Confirm),
+                cx.keystroke_text_for(&menu::SecondaryConfirm),
+                cx.keystroke_text_for(&menu::Confirm),
             )
         };
         Arc::from(format!(
@@ -228,7 +228,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                         .join(""),
                 };
 
-                StringMatchCandidate::new(id, combined_string)
+                StringMatchCandidate::new(id, &combined_string)
             })
             .collect::<Vec<_>>();
         self.matches = smol::block_on(fuzzy::match_strings(
@@ -395,7 +395,7 @@ impl PickerDelegate for RecentProjectsDelegate {
 
         Some(
             ListItem::new(ix)
-                .selected(selected)
+                .toggle_state(selected)
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .child(
