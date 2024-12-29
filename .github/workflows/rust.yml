@@ -23,10 +23,11 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
     - name: Build
+      env:
+          RUSTFLAGS: "--cfg gles"
       run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add wasm32-wasip1
-          set RUSTFLAGS="--cfg gles"
           cargo build --release 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v3
