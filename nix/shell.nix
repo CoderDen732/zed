@@ -1,57 +1,66 @@
 {
-  pkgs ? import <nixpkgs> { },
+  lib,
+  mkShell,
+  stdenv,
+  stdenvAdapters,
+  makeFontsConf,
+
+  zed-editor,
+
+  rust-analyzer,
+  cargo-nextest,
+  nixfmt-rfc-style,
+  protobuf,
+  nodejs_22,
 }:
 let
-  inherit (pkgs) lib;
+  moldStdenv = stdenvAdapters.useMoldLinker stdenv;
+  mkShell' =
+    if stdenv.hostPlatform.isLinux then mkShell.override { stdenv = moldStdenv; } else mkShell;
 in
-pkgs.mkShell rec {
+mkShell' {
+  inputsFrom = [ zed-editor ];
   packages = [
-    pkgs.clang
-    pkgs.curl
-    pkgs.cmake
-    pkgs.perl
-    pkgs.pkg-config
-    pkgs.protobuf
-    pkgs.rustPlatform.bindgenHook
-    pkgs.rust-analyzer
+    rust-analyzer
+    cargo-nextest
+    nixfmt-rfc-style
+    # TODO: package protobuf-language-server for editing zed.proto
+    # TODO: add other tools used in our scripts
+
+    # `build.nix` adds this to the `zed-editor` wrapper (see `postFixup`)
+    # we'll just put it on `$PATH`:
+    nodejs_22
   ];
 
-  buildInputs =
-    [
-      pkgs.curl
-      pkgs.fontconfig
-      pkgs.freetype
-      pkgs.libgit2
-      pkgs.openssl
-      pkgs.sqlite
-      pkgs.zlib
-      pkgs.zstd
-      pkgs.rustToolchain
-    ]
-    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-      pkgs.alsa-lib
-      pkgs.libxkbcommon
-    ]
-    ++ lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.apple-sdk_15;
+  # We set SDKROOT and DEVELOPER_DIR to the Xcode ones instead of the nixpkgs ones, because
+  # we need Swift 6.0 and nixpkgs doesn't have it
+  shellHook = lib.optionalString stdenv.hostPlatform.isDarwin ''
+    export SDKROOT="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
+    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer";
+  '';
 
-  # We set SDKROOT and DEVELOPER_DIR to the Xcode ones instead of the nixpkgs ones,
-  # because we need Swift 6.0 and nixpkgs doesn't have it.
-  # Xcode is required for development anyways
-  shellHook =
-    ''
-      export LD_LIBRARY_PATH="${lib.makeLibraryPath buildInputs}:$LD_LIBRARY_PATH"
-      export PROTOC="${pkgs.protobuf}/bin/protoc"
-    ''
-    + lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
-      export SDKROOT="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
-      export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer";
-    '';
-
-  FONTCONFIG_FILE = pkgs.makeFontsConf {
-    fontDirectories = [
-      "./assets/fonts/zed-mono"
-      "./assets/fonts/zed-sans"
-    ];
-  };
-  ZSTD_SYS_USE_PKG_CONFIG = true;
+  env =
+    let
+      baseEnvs =
+        (zed-editor.overrideAttrs (attrs: {
+          passthru = { inherit (attrs) env; };
+        })).env; # exfil `env`; it's not in drvAttrs
+    in
+    (removeAttrs baseEnvs [
+      "LK_CUSTOM_WEBRTC" # download the staticlib during the build as usual
+      "ZED_UPDATE_EXPLANATION" # allow auto-updates
+      "CARGO_PROFILE" # let you specify the profile
+      "TARGET_DIR"
+    ])
+    // {
+      # note: different than `$FONTCONFIG_FILE` in `build.nix` – this refers to relative paths
+      # outside the nix store instead of to `$src`
+      FONTCONFIG_FILE = makeFontsConf {
+        fontDirectories = [
+          "./assets/fonts/plex-mono"
+          "./assets/fonts/plex-sans"
+        ];
+      };
+      PROTOC = "${protobuf}/bin/protoc";
+    };
 }

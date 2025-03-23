@@ -1,8 +1,8 @@
 [package]
 name = "fs"
 version = "0.1.0"
-edition = "2021"
-publish = false
+edition.workspace = true
+publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [lints]
@@ -18,8 +18,8 @@ async-trait.workspace = true
 collections.workspace = true
 futures.workspace = true
 git.workspace = true
-git2.workspace = true
 gpui.workspace = true
+ignore.workspace = true
 libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
@@ -47,12 +47,9 @@ windows.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 ashpd.workspace = true
-which.workspace = true
-shlex.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = ["gpui/test-support", "git/test-support"]
-

@@ -58,6 +58,22 @@ pub fn key_to_native(key: &str) -> Cow<str> {
         "f17" => NSF17FunctionKey,
         "f18" => NSF18FunctionKey,
         "f19" => NSF19FunctionKey,
+        "f20" => NSF20FunctionKey,
+        "f21" => NSF21FunctionKey,
+        "f22" => NSF22FunctionKey,
+        "f23" => NSF23FunctionKey,
+        "f24" => NSF24FunctionKey,
+        "f25" => NSF25FunctionKey,
+        "f26" => NSF26FunctionKey,
+        "f27" => NSF27FunctionKey,
+        "f28" => NSF28FunctionKey,
+        "f29" => NSF29FunctionKey,
+        "f30" => NSF30FunctionKey,
+        "f31" => NSF31FunctionKey,
+        "f32" => NSF32FunctionKey,
+        "f33" => NSF33FunctionKey,
+        "f34" => NSF34FunctionKey,
+        "f35" => NSF35FunctionKey,
         _ => return Cow::Borrowed(key),
     };
     Cow::Owned(String::from_utf16(&[code]).unwrap())
@@ -157,6 +173,33 @@ impl PlatformInput {
                         click_count: native_event.clickCount() as usize,
                     })
                 })
+            }
+            // Some mice (like Logitech MX Master) send navigation buttons as swipe events
+            NSEventType::NSEventTypeSwipe => {
+                let navigation_direction = match native_event.phase() {
+                    NSEventPhase::NSEventPhaseEnded => match native_event.deltaX() {
+                        x if x > 0.0 => Some(NavigationDirection::Back),
+                        x if x < 0.0 => Some(NavigationDirection::Forward),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+
+                match navigation_direction {
+                    Some(direction) => window_height.map(|window_height| {
+                        Self::MouseDown(MouseDownEvent {
+                            button: MouseButton::Navigate(direction),
+                            position: point(
+                                px(native_event.locationInWindow().x as f32),
+                                window_height - px(native_event.locationInWindow().y as f32),
+                            ),
+                            modifiers: read_modifiers(native_event),
+                            click_count: 1,
+                            first_mouse: false,
+                        })
+                    }),
+                    _ => None,
+                }
             }
             NSEventType::NSScrollWheel => window_height.map(|window_height| {
                 let phase = match native_event.phase() {
@@ -305,6 +348,22 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
         Some(NSF17FunctionKey) => "f17".to_string(),
         Some(NSF18FunctionKey) => "f18".to_string(),
         Some(NSF19FunctionKey) => "f19".to_string(),
+        Some(NSF20FunctionKey) => "f20".to_string(),
+        Some(NSF21FunctionKey) => "f21".to_string(),
+        Some(NSF22FunctionKey) => "f22".to_string(),
+        Some(NSF23FunctionKey) => "f23".to_string(),
+        Some(NSF24FunctionKey) => "f24".to_string(),
+        Some(NSF25FunctionKey) => "f25".to_string(),
+        Some(NSF26FunctionKey) => "f26".to_string(),
+        Some(NSF27FunctionKey) => "f27".to_string(),
+        Some(NSF28FunctionKey) => "f28".to_string(),
+        Some(NSF29FunctionKey) => "f29".to_string(),
+        Some(NSF30FunctionKey) => "f30".to_string(),
+        Some(NSF31FunctionKey) => "f31".to_string(),
+        Some(NSF32FunctionKey) => "f32".to_string(),
+        Some(NSF33FunctionKey) => "f33".to_string(),
+        Some(NSF34FunctionKey) => "f34".to_string(),
+        Some(NSF35FunctionKey) => "f35".to_string(),
         _ => {
             // Cases to test when modifying this:
             //
@@ -322,7 +381,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
             let mut chars_with_shift = chars_for_modified_key(native_event.keyCode(), SHIFT_MOD);
             let always_use_cmd_layout = always_use_command_layout();
 
-            // Handle Dvorak+QWERTY / Russian / Armeniam
+            // Handle Dvorak+QWERTY / Russian / Armenian
             if command || always_use_cmd_layout {
                 let chars_with_cmd = chars_for_modified_key(native_event.keyCode(), CMD_MOD);
                 let chars_with_both =

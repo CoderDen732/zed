@@ -1,27 +1,65 @@
 pub mod blame;
 pub mod commit;
-pub mod diff;
 mod hosting_provider;
 mod remote;
 pub mod repository;
 pub mod status;
 
-use anyhow::{anyhow, Context, Result};
+pub use crate::hosting_provider::*;
+pub use crate::remote::*;
+use anyhow::{anyhow, Context as _, Result};
+pub use git2 as libgit;
+use gpui::action_with_deprecated_aliases;
+use gpui::actions;
+pub use repository::WORK_DIRECTORY_REPO_PATH;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-pub use crate::hosting_provider::*;
-pub use crate::remote::*;
-pub use git2 as libgit;
-
 pub static DOT_GIT: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".git"));
-pub static COOKIES: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new("cookies"));
+pub static GITIGNORE: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".gitignore"));
 pub static FSMONITOR_DAEMON: LazyLock<&'static OsStr> =
     LazyLock::new(|| OsStr::new("fsmonitor--daemon"));
-pub static GITIGNORE: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".gitignore"));
+pub static LFS_DIR: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new("lfs"));
+pub static COMMIT_MESSAGE: LazyLock<&'static OsStr> =
+    LazyLock::new(|| OsStr::new("COMMIT_EDITMSG"));
+pub static INDEX_LOCK: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new("index.lock"));
+
+actions!(
+    git,
+    [
+        // per-hunk
+        ToggleStaged,
+        StageAndNext,
+        UnstageAndNext,
+        // per-file
+        StageFile,
+        UnstageFile,
+        // repo-wide
+        StageAll,
+        UnstageAll,
+        RestoreTrackedFiles,
+        TrashUntrackedFiles,
+        Uncommit,
+        Push,
+        ForcePush,
+        Pull,
+        Fetch,
+        Commit,
+        ExpandCommitEditor,
+        GenerateCommitMessage,
+        Init,
+    ]
+);
+
+action_with_deprecated_aliases!(git, RestoreFile, ["editor::RevertFile"]);
+action_with_deprecated_aliases!(git, Restore, ["editor::RevertSelectedHunks"]);
+action_with_deprecated_aliases!(git, Blame, ["editor::ToggleGitBlame"]);
+
+/// The length of a Git short SHA.
+pub const SHORT_SHA_LENGTH: usize = 7;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Oid(libgit::Oid);
@@ -42,7 +80,7 @@ impl Oid {
 
     /// Returns this [`Oid`] as a short SHA.
     pub fn display_short(&self) -> String {
-        self.to_string().chars().take(7).collect()
+        self.to_string().chars().take(SHORT_SHA_LENGTH).collect()
     }
 }
 

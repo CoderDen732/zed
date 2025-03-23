@@ -1,90 +1,190 @@
+use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use assistant_tool::{ToolId, ToolWorkingSet};
+use chrono::{DateTime, Utc};
 use collections::HashMap;
 use context_server::manager::ContextServerManager;
 use context_server::{ContextServerFactoryRegistry, ContextServerTool};
-use gpui::{prelude::*, AppContext, Model, ModelContext, Task};
+use futures::future::{self, BoxFuture, Shared};
+use futures::FutureExt as _;
+use gpui::{
+    prelude::*, App, BackgroundExecutor, Context, Entity, Global, ReadGlobal, SharedString, Task,
+};
+use heed::types::SerdeBincode;
+use heed::Database;
+use language_model::{LanguageModelToolUseId, Role};
 use project::Project;
-use unindent::Unindent;
+use prompt_store::PromptBuilder;
+use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 
-use crate::thread::{Thread, ThreadId};
+use crate::thread::{MessageId, ProjectSnapshot, Thread, ThreadEvent, ThreadId};
+
+pub fn init(cx: &mut App) {
+    ThreadsDatabase::init(cx);
+}
 
 pub struct ThreadStore {
-    #[allow(unused)]
-    project: Model<Project>,
+    project: Entity<Project>,
     tools: Arc<ToolWorkingSet>,
-    context_server_manager: Model<ContextServerManager>,
+    prompt_builder: Arc<PromptBuilder>,
+    context_server_manager: Entity<ContextServerManager>,
     context_server_tool_ids: HashMap<Arc<str>, Vec<ToolId>>,
-    threads: Vec<Model<Thread>>,
+    threads: Vec<SerializedThreadMetadata>,
 }
 
 impl ThreadStore {
     pub fn new(
-        project: Model<Project>,
+        project: Entity<Project>,
         tools: Arc<ToolWorkingSet>,
-        cx: &mut AppContext,
-    ) -> Task<Result<Model<Self>>> {
-        cx.spawn(|mut cx| async move {
-            let this = cx.new_model(|cx: &mut ModelContext<Self>| {
-                let context_server_factory_registry =
-                    ContextServerFactoryRegistry::default_global(cx);
-                let context_server_manager = cx.new_model(|cx| {
-                    ContextServerManager::new(context_server_factory_registry, project.clone(), cx)
-                });
+        prompt_builder: Arc<PromptBuilder>,
+        cx: &mut App,
+    ) -> Result<Entity<Self>> {
+        let this = cx.new(|cx| {
+            let context_server_factory_registry = ContextServerFactoryRegistry::default_global(cx);
+            let context_server_manager = cx.new(|cx| {
+                ContextServerManager::new(context_server_factory_registry, project.clone(), cx)
+            });
 
-                let mut this = Self {
-                    project,
-                    tools,
-                    context_server_manager,
-                    context_server_tool_ids: HashMap::default(),
-                    threads: Vec::new(),
-                };
-                this.mock_recent_threads(cx);
-                this.register_context_server_handlers(cx);
+            let this = Self {
+                project,
+                tools,
+                prompt_builder,
+                context_server_manager,
+                context_server_tool_ids: HashMap::default(),
+                threads: Vec::new(),
+            };
+            this.register_context_server_handlers(cx);
+            this.reload(cx).detach_and_log_err(cx);
 
-                this
-            })?;
+            this
+        });
 
-            Ok(this)
-        })
+        Ok(this)
     }
 
-    pub fn threads(&self, cx: &ModelContext<Self>) -> Vec<Model<Thread>> {
-        let mut threads = self
-            .threads
-            .iter()
-            .filter(|thread| !thread.read(cx).is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        threads.sort_unstable_by_key(|thread| std::cmp::Reverse(thread.read(cx).updated_at()));
+    pub fn context_server_manager(&self) -> Entity<ContextServerManager> {
+        self.context_server_manager.clone()
+    }
+
+    pub fn tools(&self) -> Arc<ToolWorkingSet> {
+        self.tools.clone()
+    }
+
+    /// Returns the number of threads.
+    pub fn thread_count(&self) -> usize {
+        self.threads.len()
+    }
+
+    pub fn threads(&self) -> Vec<SerializedThreadMetadata> {
+        let mut threads = self.threads.iter().cloned().collect::<Vec<_>>();
+        threads.sort_unstable_by_key(|thread| std::cmp::Reverse(thread.updated_at));
         threads
     }
 
-    pub fn recent_threads(&self, limit: usize, cx: &ModelContext<Self>) -> Vec<Model<Thread>> {
-        self.threads(cx).into_iter().take(limit).collect()
+    pub fn recent_threads(&self, limit: usize) -> Vec<SerializedThreadMetadata> {
+        self.threads().into_iter().take(limit).collect()
     }
 
-    pub fn create_thread(&mut self, cx: &mut ModelContext<Self>) -> Model<Thread> {
-        let thread = cx.new_model(|cx| Thread::new(self.tools.clone(), cx));
-        self.threads.push(thread.clone());
-        thread
+    pub fn create_thread(&mut self, cx: &mut Context<Self>) -> Entity<Thread> {
+        cx.new(|cx| {
+            Thread::new(
+                self.project.clone(),
+                self.tools.clone(),
+                self.prompt_builder.clone(),
+                cx,
+            )
+        })
     }
 
-    pub fn open_thread(&self, id: &ThreadId, cx: &mut ModelContext<Self>) -> Option<Model<Thread>> {
-        self.threads
-            .iter()
-            .find(|thread| thread.read(cx).id() == id)
-            .cloned()
+    pub fn open_thread(
+        &self,
+        id: &ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Thread>>> {
+        let id = id.clone();
+        let database_future = ThreadsDatabase::global_future(cx);
+        cx.spawn(async move |this, cx| {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            let thread = database
+                .try_find_thread(id.clone())
+                .await?
+                .ok_or_else(|| anyhow!("no thread found with ID: {id:?}"))?;
+
+            let thread = this.update(cx, |this, cx| {
+                cx.new(|cx| {
+                    Thread::deserialize(
+                        id.clone(),
+                        thread,
+                        this.project.clone(),
+                        this.tools.clone(),
+                        this.prompt_builder.clone(),
+                        cx,
+                    )
+                })
+            })?;
+
+            let (system_prompt_context, load_error) = thread
+                .update(cx, |thread, cx| thread.load_system_prompt_context(cx))?
+                .await;
+            thread.update(cx, |thread, cx| {
+                thread.set_system_prompt_context(system_prompt_context);
+                if let Some(load_error) = load_error {
+                    cx.emit(ThreadEvent::ShowError(load_error));
+                }
+            })?;
+
+            Ok(thread)
+        })
     }
 
-    pub fn delete_thread(&mut self, id: &ThreadId, cx: &mut ModelContext<Self>) {
-        self.threads.retain(|thread| thread.read(cx).id() != id);
+    pub fn save_thread(&self, thread: &Entity<Thread>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let (metadata, serialized_thread) =
+            thread.update(cx, |thread, cx| (thread.id().clone(), thread.serialize(cx)));
+
+        let database_future = ThreadsDatabase::global_future(cx);
+        cx.spawn(async move |this, cx| {
+            let serialized_thread = serialized_thread.await?;
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            database.save_thread(metadata, serialized_thread).await?;
+
+            this.update(cx, |this, cx| this.reload(cx))?.await
+        })
     }
 
-    fn register_context_server_handlers(&self, cx: &mut ModelContext<Self>) {
+    pub fn delete_thread(&mut self, id: &ThreadId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let id = id.clone();
+        let database_future = ThreadsDatabase::global_future(cx);
+        cx.spawn(async move |this, cx| {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            database.delete_thread(id.clone()).await?;
+
+            this.update(cx, |this, _cx| {
+                this.threads.retain(|thread| thread.id != id)
+            })
+        })
+    }
+
+    pub fn reload(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let database_future = ThreadsDatabase::global_future(cx);
+        cx.spawn(async move |this, cx| {
+            let threads = database_future
+                .await
+                .map_err(|err| anyhow!(err))?
+                .list_threads()
+                .await?;
+
+            this.update(cx, |this, cx| {
+                this.threads = threads;
+                cx.notify();
+            })
+        })
+    }
+
+    fn register_context_server_handlers(&self, cx: &mut Context<Self>) {
         cx.subscribe(
             &self.context_server_manager.clone(),
             Self::handle_context_server_event,
@@ -94,9 +194,9 @@ impl ThreadStore {
 
     fn handle_context_server_event(
         &mut self,
-        context_server_manager: Model<ContextServerManager>,
+        context_server_manager: Entity<ContextServerManager>,
         event: &context_server::manager::Event,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         let tool_working_set = self.tools.clone();
         match event {
@@ -106,7 +206,7 @@ impl ThreadStore {
                     cx.spawn({
                         let server = server.clone();
                         let server_id = server_id.clone();
-                        |this, mut cx| async move {
+                        async move |this, cx| {
                             let Some(protocol) = server.client() else {
                                 return;
                             };
@@ -131,7 +231,7 @@ impl ThreadStore {
                                         })
                                         .collect::<Vec<_>>();
 
-                                    this.update(&mut cx, |this, _cx| {
+                                    this.update(cx, |this, _cx| {
                                         this.context_server_tool_ids.insert(server_id, tool_ids);
                                     })
                                     .log_err();
@@ -151,92 +251,256 @@ impl ThreadStore {
     }
 }
 
-impl ThreadStore {
-    /// Creates some mocked recent threads for testing purposes.
-    fn mock_recent_threads(&mut self, cx: &mut ModelContext<Self>) {
-        use language_model::Role;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedThreadMetadata {
+    pub id: ThreadId,
+    pub summary: SharedString,
+    pub updated_at: DateTime<Utc>,
+}
 
-        self.threads.push(cx.new_model(|cx| {
-            let mut thread = Thread::new(self.tools.clone(), cx);
-            thread.set_summary("Introduction to quantum computing", cx);
-            thread.insert_user_message("Hello! Can you help me understand quantum computing?", Vec::new(), cx);
-            thread.insert_message(Role::Assistant, "Of course! I'd be happy to help you understand quantum computing. Quantum computing is a fascinating field that uses the principles of quantum mechanics to process information. Unlike classical computers that use bits (0s and 1s), quantum computers use quantum bits or 'qubits'. These qubits can exist in multiple states simultaneously, a property called superposition. This allows quantum computers to perform certain calculations much faster than classical computers. What specific aspect of quantum computing would you like to know more about?", cx);
-            thread.insert_user_message("That's interesting! Can you explain how quantum entanglement is used in quantum computing?", Vec::new(), cx);
-            thread.insert_message(Role::Assistant, "Certainly! Quantum entanglement is a key principle used in quantum computing. When two qubits become entangled, the state of one qubit is directly related to the state of the other, regardless of the distance between them. This property is used in quantum computing to create complex quantum states and to perform operations on multiple qubits simultaneously. Entanglement allows quantum computers to process information in ways that classical computers cannot, potentially solving certain problems much more efficiently. For example, it's crucial in quantum error correction and in algorithms like quantum teleportation, which is important for quantum communication.", cx);
-            thread
-        }));
+#[derive(Serialize, Deserialize)]
+pub struct SerializedThread {
+    pub version: String,
+    pub summary: SharedString,
+    pub updated_at: DateTime<Utc>,
+    pub messages: Vec<SerializedMessage>,
+    #[serde(default)]
+    pub initial_project_snapshot: Option<Arc<ProjectSnapshot>>,
+}
 
-        self.threads.push(cx.new_model(|cx| {
-            let mut thread = Thread::new(self.tools.clone(), cx);
-            thread.set_summary("Rust web development and async programming", cx);
-            thread.insert_user_message("Can you show me an example of Rust code for a simple web server?", Vec::new(), cx);
-            thread.insert_message(Role::Assistant, "Certainly! Here's an example of a simple web server in Rust using the `actix-web` framework:
+impl SerializedThread {
+    pub const VERSION: &'static str = "0.1.0";
 
-        ```rust
-        use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-
-        async fn hello() -> impl Responder {
-            HttpResponse::Ok().body(\"Hello, World!\")
+    pub fn from_json(json: &[u8]) -> Result<Self> {
+        let saved_thread_json = serde_json::from_slice::<serde_json::Value>(json)?;
+        match saved_thread_json.get("version") {
+            Some(serde_json::Value::String(version)) => match version.as_str() {
+                SerializedThread::VERSION => Ok(serde_json::from_value::<SerializedThread>(
+                    saved_thread_json,
+                )?),
+                _ => Err(anyhow!(
+                    "unrecognized serialized thread version: {}",
+                    version
+                )),
+            },
+            None => {
+                let saved_thread =
+                    serde_json::from_value::<LegacySerializedThread>(saved_thread_json)?;
+                Ok(saved_thread.upgrade())
+            }
+            version => Err(anyhow!(
+                "unrecognized serialized thread version: {:?}",
+                version
+            )),
         }
+    }
+}
 
-        #[actix_web::main]
-        async fn main() -> std::io::Result<()> {
-            HttpServer::new(|| {
-                App::new()
-                    .route(\"/\", web::get().to(hello))
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerializedMessage {
+    pub id: MessageId,
+    pub role: Role,
+    #[serde(default)]
+    pub segments: Vec<SerializedMessageSegment>,
+    #[serde(default)]
+    pub tool_uses: Vec<SerializedToolUse>,
+    #[serde(default)]
+    pub tool_results: Vec<SerializedToolResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SerializedMessageSegment {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking { text: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerializedToolUse {
+    pub id: LanguageModelToolUseId,
+    pub name: SharedString,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerializedToolResult {
+    pub tool_use_id: LanguageModelToolUseId,
+    pub is_error: bool,
+    pub content: Arc<str>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacySerializedThread {
+    pub summary: SharedString,
+    pub updated_at: DateTime<Utc>,
+    pub messages: Vec<LegacySerializedMessage>,
+    #[serde(default)]
+    pub initial_project_snapshot: Option<Arc<ProjectSnapshot>>,
+}
+
+impl LegacySerializedThread {
+    pub fn upgrade(self) -> SerializedThread {
+        SerializedThread {
+            version: SerializedThread::VERSION.to_string(),
+            summary: self.summary,
+            updated_at: self.updated_at,
+            messages: self.messages.into_iter().map(|msg| msg.upgrade()).collect(),
+            initial_project_snapshot: self.initial_project_snapshot,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacySerializedMessage {
+    pub id: MessageId,
+    pub role: Role,
+    pub text: String,
+    #[serde(default)]
+    pub tool_uses: Vec<SerializedToolUse>,
+    #[serde(default)]
+    pub tool_results: Vec<SerializedToolResult>,
+}
+
+impl LegacySerializedMessage {
+    fn upgrade(self) -> SerializedMessage {
+        SerializedMessage {
+            id: self.id,
+            role: self.role,
+            segments: vec![SerializedMessageSegment::Text { text: self.text }],
+            tool_uses: self.tool_uses,
+            tool_results: self.tool_results,
+        }
+    }
+}
+
+struct GlobalThreadsDatabase(
+    Shared<BoxFuture<'static, Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+);
+
+impl Global for GlobalThreadsDatabase {}
+
+pub(crate) struct ThreadsDatabase {
+    executor: BackgroundExecutor,
+    env: heed::Env,
+    threads: Database<SerdeBincode<ThreadId>, SerializedThread>,
+}
+
+impl heed::BytesEncode<'_> for SerializedThread {
+    type EItem = SerializedThread;
+
+    fn bytes_encode(item: &Self::EItem) -> Result<Cow<[u8]>, heed::BoxedError> {
+        serde_json::to_vec(item).map(Cow::Owned).map_err(Into::into)
+    }
+}
+
+impl<'a> heed::BytesDecode<'a> for SerializedThread {
+    type DItem = SerializedThread;
+
+    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, heed::BoxedError> {
+        // We implement this type manually because we want to call `SerializedThread::from_json`,
+        // instead of the Deserialize trait implementation for `SerializedThread`.
+        SerializedThread::from_json(bytes).map_err(Into::into)
+    }
+}
+
+impl ThreadsDatabase {
+    fn global_future(
+        cx: &mut App,
+    ) -> Shared<BoxFuture<'static, Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>> {
+        GlobalThreadsDatabase::global(cx).0.clone()
+    }
+
+    fn init(cx: &mut App) {
+        let executor = cx.background_executor().clone();
+        let database_future = executor
+            .spawn({
+                let executor = executor.clone();
+                let database_path = paths::support_dir().join("threads/threads-db.1.mdb");
+                async move { ThreadsDatabase::new(database_path, executor) }
             })
-            .bind(\"127.0.0.1:8080\")?
-            .run()
-            .await
-        }
-        ```
+            .then(|result| future::ready(result.map(Arc::new).map_err(Arc::new)))
+            .boxed()
+            .shared();
 
-        This code creates a basic web server that responds with 'Hello, World!' when you access the root URL. Here's a breakdown of what's happening:
+        cx.set_global(GlobalThreadsDatabase(database_future));
+    }
 
-        1. We import necessary items from the `actix-web` crate.
-        2. We define an async `hello` function that returns a simple HTTP response.
-        3. In the `main` function, we set up the server to listen on `127.0.0.1:8080`.
-        4. We configure the app to respond to GET requests on the root path with our `hello` function.
+    pub fn new(path: PathBuf, executor: BackgroundExecutor) -> Result<Self> {
+        std::fs::create_dir_all(&path)?;
 
-        To run this, you'd need to add `actix-web` to your `Cargo.toml` dependencies:
+        const ONE_GB_IN_BYTES: usize = 1024 * 1024 * 1024;
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .map_size(ONE_GB_IN_BYTES)
+                .max_dbs(1)
+                .open(path)?
+        };
 
-        ```toml
-        [dependencies]
-        actix-web = \"4.0\"
-        ```
+        let mut txn = env.write_txn()?;
+        let threads = env.create_database(&mut txn, Some("threads"))?;
+        txn.commit()?;
 
-        Then you can run the server with `cargo run` and access it at `http://localhost:8080`.".unindent(), cx);
-            thread.insert_user_message("That's great! Can you explain more about async functions in Rust?", Vec::new(), cx);
-            thread.insert_message(Role::Assistant, "Certainly! Async functions are a key feature in Rust for writing efficient, non-blocking code, especially for I/O-bound operations. Here's an overview:
+        Ok(Self {
+            executor,
+            env,
+            threads,
+        })
+    }
 
-        1. **Syntax**: Async functions are declared using the `async` keyword:
+    pub fn list_threads(&self) -> Task<Result<Vec<SerializedThreadMetadata>>> {
+        let env = self.env.clone();
+        let threads = self.threads;
 
-           ```rust
-           async fn my_async_function() -> Result<(), Error> {
-               // Asynchronous code here
-           }
-           ```
+        self.executor.spawn(async move {
+            let txn = env.read_txn()?;
+            let mut iter = threads.iter(&txn)?;
+            let mut threads = Vec::new();
+            while let Some((key, value)) = iter.next().transpose()? {
+                threads.push(SerializedThreadMetadata {
+                    id: key,
+                    summary: value.summary,
+                    updated_at: value.updated_at,
+                });
+            }
 
-        2. **Futures**: Async functions return a `Future`. A `Future` represents a value that may not be available yet but will be at some point.
+            Ok(threads)
+        })
+    }
 
-        3. **Await**: Inside an async function, you can use the `.await` syntax to wait for other async operations to complete:
+    pub fn try_find_thread(&self, id: ThreadId) -> Task<Result<Option<SerializedThread>>> {
+        let env = self.env.clone();
+        let threads = self.threads;
 
-           ```rust
-           async fn fetch_data() -> Result<String, Error> {
-               let response = make_http_request().await?;
-               let data = process_response(response).await?;
-               Ok(data)
-           }
-           ```
+        self.executor.spawn(async move {
+            let txn = env.read_txn()?;
+            let thread = threads.get(&txn, &id)?;
+            Ok(thread)
+        })
+    }
 
-        4. **Non-blocking**: Async functions allow the runtime to work on other tasks while waiting for I/O or other operations to complete, making efficient use of system resources.
+    pub fn save_thread(&self, id: ThreadId, thread: SerializedThread) -> Task<Result<()>> {
+        let env = self.env.clone();
+        let threads = self.threads;
 
-        5. **Runtime**: To execute async code, you need a runtime like `tokio` or `async-std`. Actix-web, which we used in the previous example, includes its own runtime.
+        self.executor.spawn(async move {
+            let mut txn = env.write_txn()?;
+            threads.put(&mut txn, &id, &thread)?;
+            txn.commit()?;
+            Ok(())
+        })
+    }
 
-        6. **Error Handling**: Async functions work well with Rust's `?` operator for error handling.
+    pub fn delete_thread(&self, id: ThreadId) -> Task<Result<()>> {
+        let env = self.env.clone();
+        let threads = self.threads;
 
-        Async programming in Rust provides a powerful way to write concurrent code that's both safe and efficient. It's particularly useful for servers, network programming, and any application that deals with many concurrent operations.".unindent(), cx);
-            thread
-        }));
+        self.executor.spawn(async move {
+            let mut txn = env.write_txn()?;
+            threads.delete(&mut txn, &id)?;
+            txn.commit()?;
+            Ok(())
+        })
     }
 }

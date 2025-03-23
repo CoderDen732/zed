@@ -6,10 +6,12 @@ pub mod tests;
 
 use crate::{executor::Executor, Error, Result};
 use anyhow::anyhow;
-use collections::{BTreeMap, HashMap, HashSet};
+use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use dashmap::DashMap;
 use futures::StreamExt;
+use project_repository_statuses::StatusKind;
 use rand::{prelude::StdRng, Rng, SeedableRng};
+use rpc::ExtensionProvides;
 use rpc::{
     proto::{self},
     ConnectionId, ExtensionMetadata,
@@ -656,6 +658,8 @@ pub struct RejoinedProject {
     pub old_connection_id: ConnectionId,
     pub collaborators: Vec<ProjectCollaborator>,
     pub worktrees: Vec<RejoinedWorktree>,
+    pub updated_repositories: Vec<proto::UpdateRepository>,
+    pub removed_repositories: Vec<u64>,
     pub language_servers: Vec<proto::LanguageServer>,
 }
 
@@ -724,6 +728,7 @@ pub struct Project {
     pub role: ChannelRole,
     pub collaborators: Vec<ProjectCollaborator>,
     pub worktrees: BTreeMap<u64, Worktree>,
+    pub repositories: Vec<proto::UpdateRepository>,
     pub language_servers: Vec<proto::LanguageServer>,
 }
 
@@ -758,7 +763,7 @@ pub struct Worktree {
     pub root_name: String,
     pub visible: bool,
     pub entries: Vec<proto::Entry>,
-    pub repository_entries: BTreeMap<u64, proto::RepositoryEntry>,
+    pub legacy_repository_entries: BTreeMap<u64, proto::RepositoryEntry>,
     pub diagnostic_summaries: Vec<proto::DiagnosticSummary>,
     pub settings_files: Vec<WorktreeSettingsFile>,
     pub scan_id: u64,
@@ -780,6 +785,7 @@ pub struct NewExtensionVersion {
     pub repository: String,
     pub schema_version: i32,
     pub wasm_api_version: Option<String>,
+    pub provides: BTreeSet<ExtensionProvides>,
     pub published_at: PrimitiveDateTime,
 }
 
@@ -804,4 +810,93 @@ impl LocalSettingsKind {
             Self::Editorconfig => proto::LocalSettingsKind::Editorconfig,
         }
     }
+}
+
+fn db_status_to_proto(
+    entry: project_repository_statuses::Model,
+) -> anyhow::Result<proto::StatusEntry> {
+    use proto::git_file_status::{Tracked, Unmerged, Variant};
+
+    let (simple_status, variant) =
+        match (entry.status_kind, entry.first_status, entry.second_status) {
+            (StatusKind::Untracked, None, None) => (
+                proto::GitStatus::Added as i32,
+                Variant::Untracked(Default::default()),
+            ),
+            (StatusKind::Ignored, None, None) => (
+                proto::GitStatus::Added as i32,
+                Variant::Ignored(Default::default()),
+            ),
+            (StatusKind::Unmerged, Some(first_head), Some(second_head)) => (
+                proto::GitStatus::Conflict as i32,
+                Variant::Unmerged(Unmerged {
+                    first_head,
+                    second_head,
+                }),
+            ),
+            (StatusKind::Tracked, Some(index_status), Some(worktree_status)) => {
+                let simple_status = if worktree_status != proto::GitStatus::Unmodified as i32 {
+                    worktree_status
+                } else if index_status != proto::GitStatus::Unmodified as i32 {
+                    index_status
+                } else {
+                    proto::GitStatus::Unmodified as i32
+                };
+                (
+                    simple_status,
+                    Variant::Tracked(Tracked {
+                        index_status,
+                        worktree_status,
+                    }),
+                )
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unexpected combination of status fields: {entry:?}"
+                ))
+            }
+        };
+    Ok(proto::StatusEntry {
+        repo_path: entry.repo_path,
+        simple_status,
+        status: Some(proto::GitFileStatus {
+            variant: Some(variant),
+        }),
+    })
+}
+
+fn proto_status_to_db(
+    status_entry: proto::StatusEntry,
+) -> (String, StatusKind, Option<i32>, Option<i32>) {
+    use proto::git_file_status::{Tracked, Unmerged, Variant};
+
+    let (status_kind, first_status, second_status) = status_entry
+        .status
+        .clone()
+        .and_then(|status| status.variant)
+        .map_or(
+            (StatusKind::Untracked, None, None),
+            |variant| match variant {
+                Variant::Untracked(_) => (StatusKind::Untracked, None, None),
+                Variant::Ignored(_) => (StatusKind::Ignored, None, None),
+                Variant::Unmerged(Unmerged {
+                    first_head,
+                    second_head,
+                }) => (StatusKind::Unmerged, Some(first_head), Some(second_head)),
+                Variant::Tracked(Tracked {
+                    index_status,
+                    worktree_status,
+                }) => (
+                    StatusKind::Tracked,
+                    Some(index_status),
+                    Some(worktree_status),
+                ),
+            },
+        );
+    (
+        status_entry.repo_path,
+        status_kind,
+        first_status,
+        second_status,
+    )
 }

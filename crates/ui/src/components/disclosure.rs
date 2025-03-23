@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::sync::Arc;
 
 use gpui::{ClickEvent, CursorStyle};
@@ -10,8 +9,10 @@ pub struct Disclosure {
     id: ElementId,
     is_open: bool,
     selected: bool,
-    on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut WindowContext) + 'static>>,
+    on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     cursor_style: CursorStyle,
+    opened_icon: IconName,
+    closed_icon: IconName,
 }
 
 impl Disclosure {
@@ -22,14 +23,26 @@ impl Disclosure {
             selected: false,
             on_toggle: None,
             cursor_style: CursorStyle::PointingHand,
+            opened_icon: IconName::ChevronDown,
+            closed_icon: IconName::ChevronRight,
         }
     }
 
     pub fn on_toggle(
         mut self,
-        handler: impl Into<Option<Arc<dyn Fn(&ClickEvent, &mut WindowContext) + 'static>>>,
+        handler: impl Into<Option<Arc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>>,
     ) -> Self {
         self.on_toggle = handler.into();
+        self
+    }
+
+    pub fn opened_icon(mut self, icon: IconName) -> Self {
+        self.opened_icon = icon;
+        self
+    }
+
+    pub fn closed_icon(mut self, icon: IconName) -> Self {
+        self.closed_icon = icon;
         self
     }
 }
@@ -42,7 +55,7 @@ impl Toggleable for Disclosure {
 }
 
 impl Clickable for Disclosure {
-    fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut WindowContext) + 'static) -> Self {
+    fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_toggle = Some(Arc::new(handler));
         self
     }
@@ -54,12 +67,12 @@ impl Clickable for Disclosure {
 }
 
 impl RenderOnce for Disclosure {
-    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         IconButton::new(
             self.id,
             match self.is_open {
-                true => IconName::ChevronDown,
-                false => IconName::ChevronRight,
+                true => self.opened_icon,
+                false => self.closed_icon,
             },
         )
         .shape(IconButtonShape::Square)
@@ -67,7 +80,7 @@ impl RenderOnce for Disclosure {
         .icon_size(IconSize::Small)
         .toggle_state(self.selected)
         .when_some(self.on_toggle, move |this, on_toggle| {
-            this.on_click(move |event, cx| on_toggle(event, cx))
+            this.on_click(move |event, window, cx| on_toggle(event, window, cx))
         })
     }
 }

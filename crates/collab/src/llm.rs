@@ -5,6 +5,7 @@ mod token;
 use crate::api::events::SnowflakeRow;
 use crate::api::CloudflareIpCountryHeader;
 use crate::build_kinesis_client;
+use crate::rpc::MIN_ACCOUNT_AGE_FOR_LLM_USE;
 use crate::{db::UserId, executor::Executor, Cents, Config, Error, Result};
 use anyhow::{anyhow, Context as _};
 use authorization::authorize_access_to_language_model;
@@ -26,10 +27,7 @@ use reqwest_client::ReqwestClient;
 use rpc::{
     proto::Plan, LanguageModelProvider, PerformCompletionParams, EXPIRED_LLM_TOKEN_HEADER_NAME,
 };
-use rpc::{
-    ListModelsResponse, PredictEditsParams, PredictEditsResponse,
-    MAX_LLM_MONTHLY_SPEND_REACHED_HEADER_NAME,
-};
+use rpc::{ListModelsResponse, MAX_LLM_MONTHLY_SPEND_REACHED_HEADER_NAME};
 use serde_json::json;
 use std::{
     pin::Pin,
@@ -42,6 +40,8 @@ use util::ResultExt;
 
 pub use token::*;
 
+const ACTIVE_USER_COUNT_CACHE_DURATION: Duration = Duration::seconds(30);
+
 pub struct LlmState {
     pub config: Config,
     pub executor: Executor,
@@ -51,8 +51,6 @@ pub struct LlmState {
     active_user_count_by_model:
         RwLock<HashMap<(LanguageModelProvider, String), (DateTime<Utc>, ActiveUserCount)>>,
 }
-
-const ACTIVE_USER_COUNT_CACHE_DURATION: Duration = Duration::seconds(30);
 
 impl LlmState {
     pub async fn new(config: Config, executor: Executor) -> Result<Arc<Self>> {
@@ -120,7 +118,6 @@ pub fn routes() -> Router<(), Body> {
     Router::new()
         .route("/models", get(list_models))
         .route("/completion", post(perform_completion))
-        .route("/predict_edits", post(predict_edits))
         .layer(middleware::from_fn(validate_api_token))
 }
 
@@ -221,6 +218,13 @@ async fn perform_completion(
         params.model,
     );
 
+    let bypass_account_age_check = claims.has_llm_subscription || claims.bypass_account_age_check;
+    if !bypass_account_age_check {
+        if Utc::now().naive_utc() - claims.account_created_at < MIN_ACCOUNT_AGE_FOR_LLM_USE {
+            Err(anyhow!("account too young"))?
+        }
+    }
+
     authorize_access_to_language_model(
         &state.config,
         &claims,
@@ -260,6 +264,7 @@ async fn perform_completion(
             // so that users can use the new version, without having to update Zed.
             request.model = match model.as_str() {
                 "claude-3-5-sonnet" => anthropic::Model::Claude3_5Sonnet.id().to_string(),
+                "claude-3-7-sonnet" => anthropic::Model::Claude3_7Sonnet.id().to_string(),
                 "claude-3-opus" => anthropic::Model::Claude3Opus.id().to_string(),
                 "claude-3-haiku" => anthropic::Model::Claude3Haiku.id().to_string(),
                 "claude-3-sonnet" => anthropic::Model::Claude3Sonnet.id().to_string(),
@@ -434,59 +439,6 @@ fn normalize_model_name(known_models: Vec<String>, name: String) -> String {
     }
 }
 
-async fn predict_edits(
-    Extension(state): Extension<Arc<LlmState>>,
-    Extension(claims): Extension<LlmTokenClaims>,
-    _country_code_header: Option<TypedHeader<CloudflareIpCountryHeader>>,
-    Json(params): Json<PredictEditsParams>,
-) -> Result<impl IntoResponse> {
-    if !claims.is_staff {
-        return Err(anyhow!("not found"))?;
-    }
-
-    let api_url = state
-        .config
-        .prediction_api_url
-        .as_ref()
-        .context("no PREDICTION_API_URL configured on the server")?;
-    let api_key = state
-        .config
-        .prediction_api_key
-        .as_ref()
-        .context("no PREDICTION_API_KEY configured on the server")?;
-    let model = state
-        .config
-        .prediction_model
-        .as_ref()
-        .context("no PREDICTION_MODEL configured on the server")?;
-    let prompt = include_str!("./llm/prediction_prompt.md")
-        .replace("<events>", &params.input_events)
-        .replace("<excerpt>", &params.input_excerpt);
-    let mut response = open_ai::complete_text(
-        &state.http_client,
-        api_url,
-        api_key,
-        open_ai::CompletionRequest {
-            model: model.to_string(),
-            prompt: prompt.clone(),
-            max_tokens: 1024,
-            temperature: 0.,
-            prediction: Some(open_ai::Prediction::Content {
-                content: params.input_excerpt,
-            }),
-            rewrite_speculation: Some(true),
-        },
-    )
-    .await?;
-    let choice = response
-        .choices
-        .pop()
-        .context("no output from completion response")?;
-    Ok(Json(PredictEditsResponse {
-        output_excerpt: choice.text,
-    }))
-}
-
 /// The maximum monthly spending an individual user can reach on the free tier
 /// before they have to pay.
 pub const FREE_TIER_MONTHLY_SPENDING_LIMIT: Cents = Cents::from_dollars(10);
@@ -507,19 +459,15 @@ async fn check_usage_limit(
         return Ok(());
     }
 
+    let user_id = UserId::from_proto(claims.user_id);
     let model = state.db.model(provider, model_name)?;
-    let usage = state
-        .db
-        .get_usage(
-            UserId::from_proto(claims.user_id),
-            provider,
-            model_name,
-            Utc::now(),
-        )
-        .await?;
     let free_tier = claims.free_tier_monthly_spending_limit();
 
-    if usage.spending_this_month >= free_tier {
+    let spending_this_month = state
+        .db
+        .get_user_spending_for_month(user_id, Utc::now())
+        .await?;
+    if spending_this_month >= free_tier {
         if !claims.has_llm_subscription {
             return Err(Error::http(
                 StatusCode::PAYMENT_REQUIRED,
@@ -527,7 +475,8 @@ async fn check_usage_limit(
             ));
         }
 
-        if (usage.spending_this_month - free_tier) >= Cents(claims.max_monthly_spend_in_cents) {
+        let monthly_spend = spending_this_month.saturating_sub(free_tier);
+        if monthly_spend >= Cents(claims.max_monthly_spend_in_cents) {
             return Err(Error::Http(
                 StatusCode::FORBIDDEN,
                 "Maximum spending limit reached for this month.".to_string(),
@@ -551,6 +500,11 @@ async fn check_usage_limit(
     let per_user_max_tokens_per_minute =
         model.max_tokens_per_minute as usize / users_in_recent_minutes;
     let per_user_max_tokens_per_day = model.max_tokens_per_day as usize / users_in_recent_days;
+
+    let usage = state
+        .db
+        .get_usage(user_id, provider, model_name, Utc::now())
+        .await?;
 
     let checks = [
         (

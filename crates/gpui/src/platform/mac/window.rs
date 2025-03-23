@@ -17,8 +17,8 @@ use cocoa::{
     },
     base::{id, nil},
     foundation::{
-        NSArray, NSAutoreleasePool, NSDictionary, NSFastEnumeration, NSInteger, NSPoint, NSRect,
-        NSSize, NSString, NSUInteger,
+        NSArray, NSAutoreleasePool, NSDictionary, NSFastEnumeration, NSInteger, NSNotFound,
+        NSPoint, NSRect, NSSize, NSString, NSUInteger,
     },
 };
 use core_graphics::display::{CGDirectDisplayID, CGPoint, CGRect};
@@ -149,6 +149,10 @@ unsafe fn build_classes() {
             handle_view_event as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(swipeWithEvent:),
+            handle_view_event as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(flagsChanged:),
             handle_view_event as extern "C" fn(&Object, Sel, id),
         );
@@ -223,6 +227,11 @@ unsafe fn build_classes() {
             accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
         );
 
+        decl.add_method(
+            sel!(characterIndexForPoint:),
+            character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+        );
+
         decl.register()
     };
 }
@@ -258,6 +267,10 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
     decl.add_method(
         sel!(windowWillEnterFullScreen:),
         window_will_enter_fullscreen as extern "C" fn(&Object, Sel, id),
+    );
+    decl.add_method(
+        sel!(windowWillExitFullScreen:),
+        window_will_exit_fullscreen as extern "C" fn(&Object, Sel, id),
     );
     decl.add_method(
         sel!(windowDidMove:),
@@ -325,6 +338,7 @@ struct MacWindowState {
     last_key_equivalent: Option<KeyDownEvent>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
+    transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
@@ -498,6 +512,8 @@ impl MacWindow {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
+            let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
+
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
                 style_mask = NSWindowStyleMask::NSClosableWindowMask
@@ -604,6 +620,9 @@ impl MacWindow {
                 traffic_light_position: titlebar
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
+                transparent_titlebar: titlebar
+                    .as_ref()
+                    .map_or(true, |titlebar| titlebar.appears_transparent),
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
@@ -945,7 +964,7 @@ impl PlatformWindow for MacWindow {
         unsafe { self.0.lock().native_window.isKeyWindow() == YES }
     }
 
-    // is_hovered is unused on macOS. See WindowContext::is_window_hovered.
+    // is_hovered is unused on macOS. See Window::is_window_hovered.
     fn is_hovered(&self) -> bool {
         false
     }
@@ -1258,7 +1277,12 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     // We also do this for non-printing keys (like arrow keys and escape) as the IME menu
     // may need them even if there is no marked text;
     // however we skip keys with control or the input handler adds control-characters to the buffer.
-    if is_composing || (event.keystroke.key_char.is_none() && !event.keystroke.modifiers.control) {
+    // and keys with function, as the input handler swallows them.
+    if is_composing
+        || (event.keystroke.key_char.is_none()
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.function)
+    {
         {
             let mut lock = window_state.as_ref().lock();
             lock.keystroke_for_do_command = Some(event.keystroke.clone());
@@ -1476,6 +1500,42 @@ extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.fullscreen_restore_bounds = lock.bounds();
+
+    if is_macos_version_at_least(15, 3, 0) {
+        unsafe {
+            lock.native_window.setTitlebarAppearsTransparent_(NO);
+        }
+    }
+}
+
+extern "C" fn window_will_exit_fullscreen(this: &Object, _: Sel, _: id) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+
+    if is_macos_version_at_least(15, 3, 0) && lock.transparent_titlebar {
+        unsafe {
+            lock.native_window.setTitlebarAppearsTransparent_(YES);
+        }
+    }
+}
+
+#[repr(C)]
+struct NSOperatingSystemVersion {
+    major_version: NSInteger,
+    minor_version: NSInteger,
+    patch_version: NSInteger,
+}
+
+fn is_macos_version_at_least(major: NSInteger, minor: NSInteger, patch: NSInteger) -> bool {
+    unsafe {
+        let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
+        let os_version: NSOperatingSystemVersion = msg_send![process_info, operatingSystemVersion];
+        (os_version.major_version > major)
+            || (os_version.major_version == major && os_version.minor_version > minor)
+            || (os_version.major_version == major
+                && os_version.minor_version == minor
+                && os_version.patch_version >= patch)
+    }
 }
 
 extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
@@ -1678,17 +1738,7 @@ extern "C" fn first_rect_for_character_range(
     range: NSRange,
     _: id,
 ) -> NSRect {
-    let frame: NSRect = unsafe {
-        let state = get_window_state(this);
-        let lock = state.lock();
-        let mut frame = NSWindow::frame(lock.native_window);
-        let content_layout_rect: CGRect = msg_send![lock.native_window, contentLayoutRect];
-        let style_mask: NSWindowStyleMask = msg_send![lock.native_window, styleMask];
-        if !style_mask.contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask) {
-            frame.origin.y -= frame.size.height - content_layout_rect.size.height;
-        }
-        frame
-    };
+    let frame = get_frame(this);
     with_input_handler(this, |input_handler| {
         input_handler.bounds_for_range(range.to_range()?)
     })
@@ -1707,6 +1757,20 @@ extern "C" fn first_rect_for_character_range(
             )
         },
     )
+}
+
+fn get_frame(this: &Object) -> NSRect {
+    unsafe {
+        let state = get_window_state(this);
+        let lock = state.lock();
+        let mut frame = NSWindow::frame(lock.native_window);
+        let content_layout_rect: CGRect = msg_send![lock.native_window, contentLayoutRect];
+        let style_mask: NSWindowStyleMask = msg_send![lock.native_window, styleMask];
+        if !style_mask.contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask) {
+            frame.origin.y -= frame.size.height - content_layout_rect.size.height;
+        }
+        frame
+    }
 }
 
 extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NSRange) {
@@ -1820,6 +1884,24 @@ extern "C" fn accepts_first_mouse(this: &Object, _: Sel, _: id) -> BOOL {
     let mut lock = window_state.as_ref().lock();
     lock.first_mouse = true;
     YES
+}
+
+extern "C" fn character_index_for_point(this: &Object, _: Sel, position: NSPoint) -> u64 {
+    let position = screen_point_to_gpui_point(this, position);
+    with_input_handler(this, |input_handler| {
+        input_handler.character_index_for_point(position)
+    })
+    .flatten()
+    .map(|index| index as u64)
+    .unwrap_or(NSNotFound as u64)
+}
+
+fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels> {
+    let frame = get_frame(this);
+    let window_x = position.x - frame.origin.x;
+    let window_y = frame.size.height - (position.y - frame.origin.y);
+    let position = point(px(window_x as f32), px(window_y as f32));
+    position
 }
 
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {

@@ -290,10 +290,10 @@ impl MacPlatform {
                 action,
                 os_action,
             } => {
-                let keystrokes = keymap
-                    .bindings_for_action(action.as_ref())
-                    .next()
-                    .map(|binding| binding.keystrokes());
+                let keystrokes = crate::Keymap::binding_to_display_from_bindings_iterator(
+                    keymap.bindings_for_action(action.as_ref()),
+                )
+                .map(|binding| binding.keystrokes());
 
                 let selector = match os_action {
                     Some(crate::OsAction::Cut) => selector("cut:"),
@@ -347,20 +347,7 @@ impl MacPlatform {
                                 msg_send![item, setAllowsAutomaticKeyEquivalentLocalization: NO];
                         }
                         item.setKeyEquivalentModifierMask_(mask);
-                    }
-                    // For multi-keystroke bindings, render the keystroke as part of the title.
-                    else {
-                        use std::fmt::Write;
-
-                        let mut name = format!("{name} [");
-                        for (i, keystroke) in keystrokes.iter().enumerate() {
-                            if i > 0 {
-                                name.push(' ');
-                            }
-                            write!(&mut name, "{}", keystroke).unwrap();
-                        }
-                        name.push(']');
-
+                    } else {
                         item = NSMenuItem::alloc(nil)
                             .initWithTitle_action_keyEquivalent_(
                                 ns_string(&name),
@@ -757,6 +744,10 @@ impl Platform for MacPlatform {
             .detach();
 
         done_rx
+    }
+
+    fn can_select_mixed_files_and_dirs(&self) -> bool {
+        true
     }
 
     fn reveal_path(&self, path: &Path) {

@@ -1,24 +1,20 @@
 use crate::context::attach_context_to_message;
 use crate::context_store::ContextStore;
 use crate::inline_prompt_editor::CodegenStatus;
-use crate::{
-    prompts::PromptBuilder,
-    streaming_diff::{CharOperation, LineDiff, LineOperation, StreamingDiff},
-};
 use anyhow::{Context as _, Result};
 use client::telemetry::Telemetry;
 use collections::HashSet;
 use editor::{Anchor, AnchorRangeExt, MultiBuffer, MultiBufferSnapshot, ToOffset as _, ToPoint};
 use futures::{channel::mpsc, future::LocalBoxFuture, join, SinkExt, Stream, StreamExt};
-use gpui::{AppContext, Context as _, EventEmitter, Model, ModelContext, Subscription, Task};
-use language::{Buffer, IndentKind, Point, TransactionId};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
+use language::{line_diff, Buffer, IndentKind, Point, TransactionId};
 use language_model::{
-    LanguageModel, LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelTextStream, Role,
+    report_assistant_event, LanguageModel, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelTextStream, Role,
 };
-use language_models::report_assistant_event;
 use multi_buffer::MultiBufferRow;
 use parking_lot::Mutex;
+use prompt_store::PromptBuilder;
 use rope::Rope;
 use smol::future::FutureExt;
 use std::{
@@ -31,17 +27,18 @@ use std::{
     task::{self, Poll},
     time::Instant,
 };
+use streaming_diff::{CharOperation, LineDiff, LineOperation, StreamingDiff};
 use telemetry_events::{AssistantEvent, AssistantKind, AssistantPhase};
 
 pub struct BufferCodegen {
-    alternatives: Vec<Model<CodegenAlternative>>,
+    alternatives: Vec<Entity<CodegenAlternative>>,
     pub active_alternative: usize,
     seen_alternatives: HashSet<usize>,
     subscriptions: Vec<Subscription>,
-    buffer: Model<MultiBuffer>,
+    buffer: Entity<MultiBuffer>,
     range: Range<Anchor>,
     initial_transaction_id: Option<TransactionId>,
-    context_store: Model<ContextStore>,
+    context_store: Entity<ContextStore>,
     telemetry: Arc<Telemetry>,
     builder: Arc<PromptBuilder>,
     pub is_insertion: bool,
@@ -49,15 +46,15 @@ pub struct BufferCodegen {
 
 impl BufferCodegen {
     pub fn new(
-        buffer: Model<MultiBuffer>,
+        buffer: Entity<MultiBuffer>,
         range: Range<Anchor>,
         initial_transaction_id: Option<TransactionId>,
-        context_store: Model<ContextStore>,
+        context_store: Entity<ContextStore>,
         telemetry: Arc<Telemetry>,
         builder: Arc<PromptBuilder>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Self {
-        let codegen = cx.new_model(|cx| {
+        let codegen = cx.new(|cx| {
             CodegenAlternative::new(
                 buffer.clone(),
                 range.clone(),
@@ -85,7 +82,7 @@ impl BufferCodegen {
         this
     }
 
-    fn subscribe_to_alternative(&mut self, cx: &mut ModelContext<Self>) {
+    fn subscribe_to_alternative(&mut self, cx: &mut Context<Self>) {
         let codegen = self.active_alternative().clone();
         self.subscriptions.clear();
         self.subscriptions
@@ -94,22 +91,22 @@ impl BufferCodegen {
             .push(cx.subscribe(&codegen, |_, _, event, cx| cx.emit(*event)));
     }
 
-    pub fn active_alternative(&self) -> &Model<CodegenAlternative> {
+    pub fn active_alternative(&self) -> &Entity<CodegenAlternative> {
         &self.alternatives[self.active_alternative]
     }
 
-    pub fn status<'a>(&self, cx: &'a AppContext) -> &'a CodegenStatus {
+    pub fn status<'a>(&self, cx: &'a App) -> &'a CodegenStatus {
         &self.active_alternative().read(cx).status
     }
 
-    pub fn alternative_count(&self, cx: &AppContext) -> usize {
+    pub fn alternative_count(&self, cx: &App) -> usize {
         LanguageModelRegistry::read_global(cx)
             .inline_alternative_models()
             .len()
             + 1
     }
 
-    pub fn cycle_prev(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn cycle_prev(&mut self, cx: &mut Context<Self>) {
         let next_active_ix = if self.active_alternative == 0 {
             self.alternatives.len() - 1
         } else {
@@ -118,12 +115,12 @@ impl BufferCodegen {
         self.activate(next_active_ix, cx);
     }
 
-    pub fn cycle_next(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn cycle_next(&mut self, cx: &mut Context<Self>) {
         let next_active_ix = (self.active_alternative + 1) % self.alternatives.len();
         self.activate(next_active_ix, cx);
     }
 
-    fn activate(&mut self, index: usize, cx: &mut ModelContext<Self>) {
+    fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
         self.active_alternative()
             .update(cx, |codegen, cx| codegen.set_active(false, cx));
         self.seen_alternatives.insert(index);
@@ -134,7 +131,7 @@ impl BufferCodegen {
         cx.notify();
     }
 
-    pub fn start(&mut self, user_prompt: String, cx: &mut ModelContext<Self>) -> Result<()> {
+    pub fn start(&mut self, user_prompt: String, cx: &mut Context<Self>) -> Result<()> {
         let alternative_models = LanguageModelRegistry::read_global(cx)
             .inline_alternative_models()
             .to_vec();
@@ -145,7 +142,7 @@ impl BufferCodegen {
         self.alternatives.truncate(1);
 
         for _ in 0..alternative_models.len() {
-            self.alternatives.push(cx.new_model(|cx| {
+            self.alternatives.push(cx.new(|cx| {
                 CodegenAlternative::new(
                     self.buffer.clone(),
                     self.range.clone(),
@@ -174,13 +171,13 @@ impl BufferCodegen {
         Ok(())
     }
 
-    pub fn stop(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
         for codegen in &self.alternatives {
             codegen.update(cx, |codegen, cx| codegen.stop(cx));
         }
     }
 
-    pub fn undo(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
         self.active_alternative()
             .update(cx, |codegen, cx| codegen.undo(cx));
 
@@ -192,27 +189,27 @@ impl BufferCodegen {
         });
     }
 
-    pub fn buffer(&self, cx: &AppContext) -> Model<MultiBuffer> {
+    pub fn buffer(&self, cx: &App) -> Entity<MultiBuffer> {
         self.active_alternative().read(cx).buffer.clone()
     }
 
-    pub fn old_buffer(&self, cx: &AppContext) -> Model<Buffer> {
+    pub fn old_buffer(&self, cx: &App) -> Entity<Buffer> {
         self.active_alternative().read(cx).old_buffer.clone()
     }
 
-    pub fn snapshot(&self, cx: &AppContext) -> MultiBufferSnapshot {
+    pub fn snapshot(&self, cx: &App) -> MultiBufferSnapshot {
         self.active_alternative().read(cx).snapshot.clone()
     }
 
-    pub fn edit_position(&self, cx: &AppContext) -> Option<Anchor> {
+    pub fn edit_position(&self, cx: &App) -> Option<Anchor> {
         self.active_alternative().read(cx).edit_position
     }
 
-    pub fn diff<'a>(&self, cx: &'a AppContext) -> &'a Diff {
+    pub fn diff<'a>(&self, cx: &'a App) -> &'a Diff {
         &self.active_alternative().read(cx).diff
     }
 
-    pub fn last_equal_ranges<'a>(&self, cx: &'a AppContext) -> &'a [Range<Anchor>] {
+    pub fn last_equal_ranges<'a>(&self, cx: &'a App) -> &'a [Range<Anchor>] {
         self.active_alternative().read(cx).last_equal_ranges()
     }
 }
@@ -220,8 +217,8 @@ impl BufferCodegen {
 impl EventEmitter<CodegenEvent> for BufferCodegen {}
 
 pub struct CodegenAlternative {
-    buffer: Model<MultiBuffer>,
-    old_buffer: Model<Buffer>,
+    buffer: Entity<MultiBuffer>,
+    old_buffer: Entity<Buffer>,
     snapshot: MultiBufferSnapshot,
     edit_position: Option<Anchor>,
     range: Range<Anchor>,
@@ -230,7 +227,7 @@ pub struct CodegenAlternative {
     status: CodegenStatus,
     generation: Task<()>,
     diff: Diff,
-    context_store: Option<Model<ContextStore>>,
+    context_store: Option<Entity<ContextStore>>,
     telemetry: Option<Arc<Telemetry>>,
     _subscription: gpui::Subscription,
     builder: Arc<PromptBuilder>,
@@ -247,27 +244,30 @@ impl EventEmitter<CodegenEvent> for CodegenAlternative {}
 
 impl CodegenAlternative {
     pub fn new(
-        buffer: Model<MultiBuffer>,
+        buffer: Entity<MultiBuffer>,
         range: Range<Anchor>,
         active: bool,
-        context_store: Option<Model<ContextStore>>,
+        context_store: Option<Entity<ContextStore>>,
         telemetry: Option<Arc<Telemetry>>,
         builder: Arc<PromptBuilder>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = buffer.read(cx).snapshot(cx);
 
-        let (old_buffer, _, _) = buffer
-            .read(cx)
-            .range_to_buffer_ranges(range.clone(), cx)
+        let (old_buffer, _, _) = snapshot
+            .range_to_buffer_ranges(range.clone())
             .pop()
             .unwrap();
-        let old_buffer = cx.new_model(|cx| {
-            let old_buffer = old_buffer.read(cx);
+        let old_buffer = cx.new(|cx| {
             let text = old_buffer.as_rope().clone();
             let line_ending = old_buffer.line_ending();
             let language = old_buffer.language().cloned();
-            let language_registry = old_buffer.language_registry();
+            let language_registry = buffer
+                .read(cx)
+                .buffer(old_buffer.remote_id())
+                .unwrap()
+                .read(cx)
+                .language_registry();
 
             let mut buffer = Buffer::local_normalized(text, line_ending, cx);
             buffer.set_language(language, cx);
@@ -302,7 +302,7 @@ impl CodegenAlternative {
         }
     }
 
-    pub fn set_active(&mut self, active: bool, cx: &mut ModelContext<Self>) {
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if active != self.active {
             self.active = active;
 
@@ -326,9 +326,9 @@ impl CodegenAlternative {
 
     fn handle_buffer_event(
         &mut self,
-        _buffer: Model<MultiBuffer>,
+        _buffer: Entity<MultiBuffer>,
         event: &multi_buffer::Event,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         if let multi_buffer::Event::TransactionUndone { transaction_id } = event {
             if self.transformation_transaction_id == Some(*transaction_id) {
@@ -347,7 +347,7 @@ impl CodegenAlternative {
         &mut self,
         user_prompt: String,
         model: Arc<dyn LanguageModel>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Result<()> {
         if let Some(transformation_transaction_id) = self.transformation_transaction_id.take() {
             self.buffer.update(cx, |buffer, cx| {
@@ -367,18 +367,14 @@ impl CodegenAlternative {
                 let request = self.build_request(user_prompt, cx)?;
                 self.request = Some(request.clone());
 
-                cx.spawn(|_, cx| async move { model.stream_completion_text(request, &cx).await })
+                cx.spawn(async move |_, cx| model.stream_completion_text(request, &cx).await)
                     .boxed_local()
             };
         self.handle_stream(telemetry_id, provider_id.to_string(), api_key, stream, cx);
         Ok(())
     }
 
-    fn build_request(
-        &self,
-        user_prompt: String,
-        cx: &mut AppContext,
-    ) -> Result<LanguageModelRequest> {
+    fn build_request(&self, user_prompt: String, cx: &mut App) -> Result<LanguageModelRequest> {
         let buffer = self.buffer.read(cx).snapshot(cx);
         let language = buffer.language_at(self.range.start);
         let language_name = if let Some(language) = language.as_ref() {
@@ -418,8 +414,7 @@ impl CodegenAlternative {
         };
 
         if let Some(context_store) = &self.context_store {
-            let context = context_store.update(cx, |this, _cx| this.context().clone());
-            attach_context_to_message(&mut request_message, context);
+            attach_context_to_message(&mut request_message, context_store.read(cx).snapshot(cx));
         }
 
         request_message.content.push(prompt.into());
@@ -438,7 +433,7 @@ impl CodegenAlternative {
         model_provider_id: String,
         model_api_key: Option<String>,
         stream: impl 'static + Future<Output = Result<LanguageModelTextStream>>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         let start_time = Instant::now();
         let snapshot = self.snapshot.clone();
@@ -471,10 +466,11 @@ impl CodegenAlternative {
         let telemetry = self.telemetry.clone();
         let language_name = {
             let multibuffer = self.buffer.read(cx);
-            let ranges = multibuffer.range_to_buffer_ranges(self.range.clone(), cx);
+            let snapshot = multibuffer.snapshot(cx);
+            let ranges = snapshot.range_to_buffer_ranges(self.range.clone());
             ranges
                 .first()
-                .and_then(|(buffer, _, _)| buffer.read(cx).language())
+                .and_then(|(buffer, _, _)| buffer.language())
                 .map(|language| language.name())
         };
 
@@ -484,218 +480,212 @@ impl CodegenAlternative {
         let completion = Arc::new(Mutex::new(String::new()));
         let completion_clone = completion.clone();
 
-        self.generation = cx.spawn(|codegen, mut cx| {
-            async move {
-                let stream = stream.await;
-                let message_id = stream
-                    .as_ref()
-                    .ok()
-                    .and_then(|stream| stream.message_id.clone());
-                let generate = async {
-                    let (mut diff_tx, mut diff_rx) = mpsc::channel(1);
-                    let executor = cx.background_executor().clone();
-                    let message_id = message_id.clone();
-                    let line_based_stream_diff: Task<anyhow::Result<()>> =
-                        cx.background_executor().spawn(async move {
-                            let mut response_latency = None;
-                            let request_start = Instant::now();
-                            let diff = async {
-                                let chunks = StripInvalidSpans::new(stream?.stream);
-                                futures::pin_mut!(chunks);
-                                let mut diff = StreamingDiff::new(selected_text.to_string());
-                                let mut line_diff = LineDiff::default();
+        self.generation = cx.spawn(async move |codegen, cx| {
+            let stream = stream.await;
+            let message_id = stream
+                .as_ref()
+                .ok()
+                .and_then(|stream| stream.message_id.clone());
+            let generate = async {
+                let (mut diff_tx, mut diff_rx) = mpsc::channel(1);
+                let executor = cx.background_executor().clone();
+                let message_id = message_id.clone();
+                let line_based_stream_diff: Task<anyhow::Result<()>> =
+                    cx.background_spawn(async move {
+                        let mut response_latency = None;
+                        let request_start = Instant::now();
+                        let diff = async {
+                            let chunks = StripInvalidSpans::new(stream?.stream);
+                            futures::pin_mut!(chunks);
+                            let mut diff = StreamingDiff::new(selected_text.to_string());
+                            let mut line_diff = LineDiff::default();
 
-                                let mut new_text = String::new();
-                                let mut base_indent = None;
-                                let mut line_indent = None;
-                                let mut first_line = true;
+                            let mut new_text = String::new();
+                            let mut base_indent = None;
+                            let mut line_indent = None;
+                            let mut first_line = true;
 
-                                while let Some(chunk) = chunks.next().await {
-                                    if response_latency.is_none() {
-                                        response_latency = Some(request_start.elapsed());
-                                    }
-                                    let chunk = chunk?;
-                                    completion_clone.lock().push_str(&chunk);
+                            while let Some(chunk) = chunks.next().await {
+                                if response_latency.is_none() {
+                                    response_latency = Some(request_start.elapsed());
+                                }
+                                let chunk = chunk?;
+                                completion_clone.lock().push_str(&chunk);
 
-                                    let mut lines = chunk.split('\n').peekable();
-                                    while let Some(line) = lines.next() {
-                                        new_text.push_str(line);
-                                        if line_indent.is_none() {
-                                            if let Some(non_whitespace_ch_ix) =
-                                                new_text.find(|ch: char| !ch.is_whitespace())
-                                            {
-                                                line_indent = Some(non_whitespace_ch_ix);
-                                                base_indent = base_indent.or(line_indent);
+                                let mut lines = chunk.split('\n').peekable();
+                                while let Some(line) = lines.next() {
+                                    new_text.push_str(line);
+                                    if line_indent.is_none() {
+                                        if let Some(non_whitespace_ch_ix) =
+                                            new_text.find(|ch: char| !ch.is_whitespace())
+                                        {
+                                            line_indent = Some(non_whitespace_ch_ix);
+                                            base_indent = base_indent.or(line_indent);
 
-                                                let line_indent = line_indent.unwrap();
-                                                let base_indent = base_indent.unwrap();
-                                                let indent_delta =
-                                                    line_indent as i32 - base_indent as i32;
-                                                let mut corrected_indent_len = cmp::max(
-                                                    0,
-                                                    suggested_line_indent.len as i32 + indent_delta,
-                                                )
-                                                    as usize;
-                                                if first_line {
-                                                    corrected_indent_len = corrected_indent_len
-                                                        .saturating_sub(
-                                                            selection_start.column as usize,
-                                                        );
-                                                }
-
-                                                let indent_char = suggested_line_indent.char();
-                                                let mut indent_buffer = [0; 4];
-                                                let indent_str =
-                                                    indent_char.encode_utf8(&mut indent_buffer);
-                                                new_text.replace_range(
-                                                    ..line_indent,
-                                                    &indent_str.repeat(corrected_indent_len),
-                                                );
+                                            let line_indent = line_indent.unwrap();
+                                            let base_indent = base_indent.unwrap();
+                                            let indent_delta =
+                                                line_indent as i32 - base_indent as i32;
+                                            let mut corrected_indent_len = cmp::max(
+                                                0,
+                                                suggested_line_indent.len as i32 + indent_delta,
+                                            )
+                                                as usize;
+                                            if first_line {
+                                                corrected_indent_len = corrected_indent_len
+                                                    .saturating_sub(
+                                                        selection_start.column as usize,
+                                                    );
                                             }
-                                        }
 
-                                        if line_indent.is_some() {
-                                            let char_ops = diff.push_new(&new_text);
-                                            line_diff
-                                                .push_char_operations(&char_ops, &selected_text);
-                                            diff_tx
-                                                .send((char_ops, line_diff.line_operations()))
-                                                .await?;
+                                            let indent_char = suggested_line_indent.char();
+                                            let mut indent_buffer = [0; 4];
+                                            let indent_str =
+                                                indent_char.encode_utf8(&mut indent_buffer);
+                                            new_text.replace_range(
+                                                ..line_indent,
+                                                &indent_str.repeat(corrected_indent_len),
+                                            );
+                                        }
+                                    }
+
+                                    if line_indent.is_some() {
+                                        let char_ops = diff.push_new(&new_text);
+                                        line_diff.push_char_operations(&char_ops, &selected_text);
+                                        diff_tx
+                                            .send((char_ops, line_diff.line_operations()))
+                                            .await?;
+                                        new_text.clear();
+                                    }
+
+                                    if lines.peek().is_some() {
+                                        let char_ops = diff.push_new("\n");
+                                        line_diff.push_char_operations(&char_ops, &selected_text);
+                                        diff_tx
+                                            .send((char_ops, line_diff.line_operations()))
+                                            .await?;
+                                        if line_indent.is_none() {
+                                            // Don't write out the leading indentation in empty lines on the next line
+                                            // This is the case where the above if statement didn't clear the buffer
                                             new_text.clear();
                                         }
-
-                                        if lines.peek().is_some() {
-                                            let char_ops = diff.push_new("\n");
-                                            line_diff
-                                                .push_char_operations(&char_ops, &selected_text);
-                                            diff_tx
-                                                .send((char_ops, line_diff.line_operations()))
-                                                .await?;
-                                            if line_indent.is_none() {
-                                                // Don't write out the leading indentation in empty lines on the next line
-                                                // This is the case where the above if statement didn't clear the buffer
-                                                new_text.clear();
-                                            }
-                                            line_indent = None;
-                                            first_line = false;
-                                        }
+                                        line_indent = None;
+                                        first_line = false;
                                     }
                                 }
-
-                                let mut char_ops = diff.push_new(&new_text);
-                                char_ops.extend(diff.finish());
-                                line_diff.push_char_operations(&char_ops, &selected_text);
-                                line_diff.finish(&selected_text);
-                                diff_tx
-                                    .send((char_ops, line_diff.line_operations()))
-                                    .await?;
-
-                                anyhow::Ok(())
-                            };
-
-                            let result = diff.await;
-
-                            let error_message =
-                                result.as_ref().err().map(|error| error.to_string());
-                            report_assistant_event(
-                                AssistantEvent {
-                                    conversation_id: None,
-                                    message_id,
-                                    kind: AssistantKind::Inline,
-                                    phase: AssistantPhase::Response,
-                                    model: model_telemetry_id,
-                                    model_provider: model_provider_id.to_string(),
-                                    response_latency,
-                                    error_message,
-                                    language_name: language_name.map(|name| name.to_proto()),
-                                },
-                                telemetry,
-                                http_client,
-                                model_api_key,
-                                &executor,
-                            );
-
-                            result?;
-                            Ok(())
-                        });
-
-                    while let Some((char_ops, line_ops)) = diff_rx.next().await {
-                        codegen.update(&mut cx, |codegen, cx| {
-                            codegen.last_equal_ranges.clear();
-
-                            let edits = char_ops
-                                .into_iter()
-                                .filter_map(|operation| match operation {
-                                    CharOperation::Insert { text } => {
-                                        let edit_start = snapshot.anchor_after(edit_start);
-                                        Some((edit_start..edit_start, text))
-                                    }
-                                    CharOperation::Delete { bytes } => {
-                                        let edit_end = edit_start + bytes;
-                                        let edit_range = snapshot.anchor_after(edit_start)
-                                            ..snapshot.anchor_before(edit_end);
-                                        edit_start = edit_end;
-                                        Some((edit_range, String::new()))
-                                    }
-                                    CharOperation::Keep { bytes } => {
-                                        let edit_end = edit_start + bytes;
-                                        let edit_range = snapshot.anchor_after(edit_start)
-                                            ..snapshot.anchor_before(edit_end);
-                                        edit_start = edit_end;
-                                        codegen.last_equal_ranges.push(edit_range);
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-
-                            if codegen.active {
-                                codegen.apply_edits(edits.iter().cloned(), cx);
-                                codegen.reapply_line_based_diff(line_ops.iter().cloned(), cx);
                             }
-                            codegen.edits.extend(edits);
-                            codegen.line_operations = line_ops;
-                            codegen.edit_position = Some(snapshot.anchor_after(edit_start));
 
-                            cx.notify();
-                        })?;
-                    }
+                            let mut char_ops = diff.push_new(&new_text);
+                            char_ops.extend(diff.finish());
+                            line_diff.push_char_operations(&char_ops, &selected_text);
+                            line_diff.finish(&selected_text);
+                            diff_tx
+                                .send((char_ops, line_diff.line_operations()))
+                                .await?;
 
-                    // Streaming stopped and we have the new text in the buffer, and a line-based diff applied for the whole new buffer.
-                    // That diff is not what a regular diff is and might look unexpected, ergo apply a regular diff.
-                    // It's fine to apply even if the rest of the line diffing fails, as no more hunks are coming through `diff_rx`.
-                    let batch_diff_task =
-                        codegen.update(&mut cx, |codegen, cx| codegen.reapply_batch_diff(cx))?;
-                    let (line_based_stream_diff, ()) =
-                        join!(line_based_stream_diff, batch_diff_task);
-                    line_based_stream_diff?;
+                            anyhow::Ok(())
+                        };
 
-                    anyhow::Ok(())
-                };
+                        let result = diff.await;
 
-                let result = generate.await;
-                let elapsed_time = start_time.elapsed().as_secs_f64();
+                        let error_message = result.as_ref().err().map(|error| error.to_string());
+                        report_assistant_event(
+                            AssistantEvent {
+                                conversation_id: None,
+                                message_id,
+                                kind: AssistantKind::Inline,
+                                phase: AssistantPhase::Response,
+                                model: model_telemetry_id,
+                                model_provider: model_provider_id.to_string(),
+                                response_latency,
+                                error_message,
+                                language_name: language_name.map(|name| name.to_proto()),
+                            },
+                            telemetry,
+                            http_client,
+                            model_api_key,
+                            &executor,
+                        );
 
-                codegen
-                    .update(&mut cx, |this, cx| {
-                        this.message_id = message_id;
-                        this.last_equal_ranges.clear();
-                        if let Err(error) = result {
-                            this.status = CodegenStatus::Error(error);
-                        } else {
-                            this.status = CodegenStatus::Done;
+                        result?;
+                        Ok(())
+                    });
+
+                while let Some((char_ops, line_ops)) = diff_rx.next().await {
+                    codegen.update(cx, |codegen, cx| {
+                        codegen.last_equal_ranges.clear();
+
+                        let edits = char_ops
+                            .into_iter()
+                            .filter_map(|operation| match operation {
+                                CharOperation::Insert { text } => {
+                                    let edit_start = snapshot.anchor_after(edit_start);
+                                    Some((edit_start..edit_start, text))
+                                }
+                                CharOperation::Delete { bytes } => {
+                                    let edit_end = edit_start + bytes;
+                                    let edit_range = snapshot.anchor_after(edit_start)
+                                        ..snapshot.anchor_before(edit_end);
+                                    edit_start = edit_end;
+                                    Some((edit_range, String::new()))
+                                }
+                                CharOperation::Keep { bytes } => {
+                                    let edit_end = edit_start + bytes;
+                                    let edit_range = snapshot.anchor_after(edit_start)
+                                        ..snapshot.anchor_before(edit_end);
+                                    edit_start = edit_end;
+                                    codegen.last_equal_ranges.push(edit_range);
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+
+                        if codegen.active {
+                            codegen.apply_edits(edits.iter().cloned(), cx);
+                            codegen.reapply_line_based_diff(line_ops.iter().cloned(), cx);
                         }
-                        this.elapsed_time = Some(elapsed_time);
-                        this.completion = Some(completion.lock().clone());
-                        cx.emit(CodegenEvent::Finished);
+                        codegen.edits.extend(edits);
+                        codegen.line_operations = line_ops;
+                        codegen.edit_position = Some(snapshot.anchor_after(edit_start));
+
                         cx.notify();
-                    })
-                    .ok();
-            }
+                    })?;
+                }
+
+                // Streaming stopped and we have the new text in the buffer, and a line-based diff applied for the whole new buffer.
+                // That diff is not what a regular diff is and might look unexpected, ergo apply a regular diff.
+                // It's fine to apply even if the rest of the line diffing fails, as no more hunks are coming through `diff_rx`.
+                let batch_diff_task =
+                    codegen.update(cx, |codegen, cx| codegen.reapply_batch_diff(cx))?;
+                let (line_based_stream_diff, ()) = join!(line_based_stream_diff, batch_diff_task);
+                line_based_stream_diff?;
+
+                anyhow::Ok(())
+            };
+
+            let result = generate.await;
+            let elapsed_time = start_time.elapsed().as_secs_f64();
+
+            codegen
+                .update(cx, |this, cx| {
+                    this.message_id = message_id;
+                    this.last_equal_ranges.clear();
+                    if let Err(error) = result {
+                        this.status = CodegenStatus::Error(error);
+                    } else {
+                        this.status = CodegenStatus::Done;
+                    }
+                    this.elapsed_time = Some(elapsed_time);
+                    this.completion = Some(completion.lock().clone());
+                    cx.emit(CodegenEvent::Finished);
+                    cx.notify();
+                })
+                .ok();
         });
         cx.notify();
     }
 
-    pub fn stop(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.last_equal_ranges.clear();
         if self.diff.is_empty() {
             self.status = CodegenStatus::Idle;
@@ -707,7 +697,7 @@ impl CodegenAlternative {
         cx.notify();
     }
 
-    pub fn undo(&mut self, cx: &mut ModelContext<Self>) {
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
         self.buffer.update(cx, |buffer, cx| {
             if let Some(transaction_id) = self.transformation_transaction_id.take() {
                 buffer.undo_transaction(transaction_id, cx);
@@ -719,7 +709,7 @@ impl CodegenAlternative {
     fn apply_edits(
         &mut self,
         edits: impl IntoIterator<Item = (Range<Anchor>, String)>,
-        cx: &mut ModelContext<CodegenAlternative>,
+        cx: &mut Context<CodegenAlternative>,
     ) {
         let transaction = self.buffer.update(cx, |buffer, cx| {
             // Avoid grouping assistant edits with user edits.
@@ -746,7 +736,7 @@ impl CodegenAlternative {
     fn reapply_line_based_diff(
         &mut self,
         line_operations: impl IntoIterator<Item = LineOperation>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         let old_snapshot = self.snapshot.clone();
         let old_range = self.range.to_point(&old_snapshot);
@@ -802,16 +792,15 @@ impl CodegenAlternative {
         }
     }
 
-    fn reapply_batch_diff(&mut self, cx: &mut ModelContext<Self>) -> Task<()> {
+    fn reapply_batch_diff(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let old_snapshot = self.snapshot.clone();
         let old_range = self.range.to_point(&old_snapshot);
         let new_snapshot = self.buffer.read(cx).snapshot(cx);
         let new_range = self.range.to_point(&new_snapshot);
 
-        cx.spawn(|codegen, mut cx| async move {
+        cx.spawn(async move |codegen, cx| {
             let (deleted_row_ranges, inserted_row_ranges) = cx
-                .background_executor()
-                .spawn(async move {
+                .background_spawn(async move {
                     let old_text = old_snapshot
                         .text_for_range(
                             Point::new(old_range.start.row, 0)
@@ -831,58 +820,35 @@ impl CodegenAlternative {
                         )
                         .collect::<String>();
 
-                    let mut old_row = old_range.start.row;
-                    let mut new_row = new_range.start.row;
-                    let batch_diff =
-                        similar::TextDiff::from_lines(old_text.as_str(), new_text.as_str());
-
+                    let old_start_row = old_range.start.row;
+                    let new_start_row = new_range.start.row;
                     let mut deleted_row_ranges: Vec<(Anchor, RangeInclusive<u32>)> = Vec::new();
                     let mut inserted_row_ranges = Vec::new();
-                    for change in batch_diff.iter_all_changes() {
-                        let line_count = change.value().lines().count() as u32;
-                        match change.tag() {
-                            similar::ChangeTag::Equal => {
-                                old_row += line_count;
-                                new_row += line_count;
-                            }
-                            similar::ChangeTag::Delete => {
-                                let old_end_row = old_row + line_count - 1;
-                                let new_row = new_snapshot.anchor_before(Point::new(new_row, 0));
-
-                                if let Some((_, last_deleted_row_range)) =
-                                    deleted_row_ranges.last_mut()
-                                {
-                                    if *last_deleted_row_range.end() + 1 == old_row {
-                                        *last_deleted_row_range =
-                                            *last_deleted_row_range.start()..=old_end_row;
-                                    } else {
-                                        deleted_row_ranges.push((new_row, old_row..=old_end_row));
-                                    }
-                                } else {
-                                    deleted_row_ranges.push((new_row, old_row..=old_end_row));
-                                }
-
-                                old_row += line_count;
-                            }
-                            similar::ChangeTag::Insert => {
-                                let new_end_row = new_row + line_count - 1;
-                                let start = new_snapshot.anchor_before(Point::new(new_row, 0));
-                                let end = new_snapshot.anchor_before(Point::new(
-                                    new_end_row,
-                                    new_snapshot.line_len(MultiBufferRow(new_end_row)),
-                                ));
-                                inserted_row_ranges.push(start..end);
-                                new_row += line_count;
-                            }
+                    for (old_rows, new_rows) in line_diff(&old_text, &new_text) {
+                        let old_rows = old_start_row + old_rows.start..old_start_row + old_rows.end;
+                        let new_rows = new_start_row + new_rows.start..new_start_row + new_rows.end;
+                        if !old_rows.is_empty() {
+                            deleted_row_ranges.push((
+                                new_snapshot.anchor_before(Point::new(new_rows.start, 0)),
+                                old_rows.start..=old_rows.end - 1,
+                            ));
+                        }
+                        if !new_rows.is_empty() {
+                            let start = new_snapshot.anchor_before(Point::new(new_rows.start, 0));
+                            let new_end_row = new_rows.end - 1;
+                            let end = new_snapshot.anchor_before(Point::new(
+                                new_end_row,
+                                new_snapshot.line_len(MultiBufferRow(new_end_row)),
+                            ));
+                            inserted_row_ranges.push(start..end);
                         }
                     }
-
                     (deleted_row_ranges, inserted_row_ranges)
                 })
                 .await;
 
             codegen
-                .update(&mut cx, |codegen, cx| {
+                .update(cx, |codegen, cx| {
                     codegen.diff.deleted_row_ranges = deleted_row_ranges;
                     codegen.diff.inserted_row_ranges = inserted_row_ranges;
                     cx.notify();
@@ -1049,7 +1015,7 @@ mod tests {
         stream::{self},
         Stream,
     };
-    use gpui::{Context, TestAppContext};
+    use gpui::TestAppContext;
     use indoc::indoc;
     use language::{
         language_settings, tree_sitter_rust, Buffer, Language, LanguageConfig, LanguageMatcher,
@@ -1080,15 +1046,14 @@ mod tests {
                 }
             }
         "};
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let range = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_after(Point::new(4, 5))
         });
         let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
+        let codegen = cx.new(|cx| {
             CodegenAlternative::new(
                 buffer.clone(),
                 range.clone(),
@@ -1145,15 +1110,14 @@ mod tests {
                 le
             }
         "};
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let range = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 6))..snapshot.anchor_after(Point::new(1, 6))
         });
         let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
+        let codegen = cx.new(|cx| {
             CodegenAlternative::new(
                 buffer.clone(),
                 range.clone(),
@@ -1213,15 +1177,14 @@ mod tests {
             "  \n",
             "}\n" //
         );
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let range = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 2))..snapshot.anchor_after(Point::new(1, 2))
         });
         let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
+        let codegen = cx.new(|cx| {
             CodegenAlternative::new(
                 buffer.clone(),
                 range.clone(),
@@ -1281,14 +1244,14 @@ mod tests {
             \t}
             }
         "};
-        let buffer = cx.new_model(|cx| Buffer::local(text, cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer = cx.new(|cx| Buffer::local(text, cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let range = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(4, 2))
         });
         let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
+        let codegen = cx.new(|cx| {
             CodegenAlternative::new(
                 buffer.clone(),
                 range.clone(),
@@ -1336,15 +1299,14 @@ mod tests {
                 let x = 0;
             }
         "};
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let range = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_after(Point::new(1, 14))
         });
         let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
+        let codegen = cx.new(|cx| {
             CodegenAlternative::new(
                 buffer.clone(),
                 range.clone(),
@@ -1431,7 +1393,7 @@ mod tests {
     }
 
     fn simulate_response_stream(
-        codegen: Model<CodegenAlternative>,
+        codegen: Entity<CodegenAlternative>,
         cx: &mut TestAppContext,
     ) -> mpsc::UnboundedSender<String> {
         let (chunks_tx, chunks_rx) = mpsc::unbounded();

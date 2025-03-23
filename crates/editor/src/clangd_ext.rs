@@ -1,13 +1,14 @@
 use anyhow::Context as _;
-use gpui::{View, ViewContext, WindowContext};
+use gpui::{App, Context, Entity, Window};
 use language::Language;
 use url::Url;
+use workspace::{OpenOptions, OpenVisible};
 
 use crate::lsp_ext::find_specific_language_server_in_selection;
 
 use crate::{element::register_action, Editor, SwitchSourceHeader};
 
-const CLANGD_SERVER_NAME: &str = "clangd";
+use project::lsp_store::clangd_ext::CLANGD_SERVER_NAME;
 
 fn is_c_language(language: &Language) -> bool {
     return language.name() == "C++".into() || language.name() == "C".into();
@@ -16,7 +17,8 @@ fn is_c_language(language: &Language) -> bool {
 pub fn switch_source_header(
     editor: &mut Editor,
     _: &SwitchSourceHeader,
-    cx: &mut ViewContext<Editor>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
 ) {
     let Some(project) = &editor.project else {
         return;
@@ -45,11 +47,11 @@ pub fn switch_source_header(
         project.request_lsp(
             buffer,
             project::LanguageServerToQuery::Other(server_to_query),
-            project::lsp_ext_command::SwitchSourceHeader,
+            project::lsp_store::lsp_ext_command::SwitchSourceHeader,
             cx,
         )
     });
-    cx.spawn(|_editor, mut cx| async move {
+    cx.spawn_in(window, async move |_editor, cx| {
         let switch_source_header = switch_source_header_task
             .await
             .with_context(|| format!("Switch source/header LSP request for path \"{source_file}\" failed"))?;
@@ -70,8 +72,8 @@ pub fn switch_source_header(
         })?;
 
         workspace
-            .update(&mut cx, |workspace, view_cx| {
-                workspace.open_abs_path(path, false, view_cx)
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(path, OpenOptions { visible: Some(OpenVisible::None), ..Default::default() }, window, cx)
             })
             .with_context(|| {
                 format!(
@@ -84,11 +86,11 @@ pub fn switch_source_header(
     .detach_and_log_err(cx);
 }
 
-pub fn apply_related_actions(editor: &View<Editor>, cx: &mut WindowContext) {
+pub fn apply_related_actions(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
     if editor.update(cx, |e, cx| {
         find_specific_language_server_in_selection(e, cx, is_c_language, CLANGD_SERVER_NAME)
             .is_some()
     }) {
-        register_action(editor, cx, switch_source_header);
+        register_action(editor, window, switch_source_header);
     }
 }

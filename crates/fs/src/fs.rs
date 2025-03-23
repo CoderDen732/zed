@@ -1,33 +1,27 @@
 #[cfg(target_os = "macos")]
 mod mac_watcher;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub mod linux_watcher;
+#[cfg(not(target_os = "macos"))]
+pub mod fs_watcher;
 
-use anyhow::{anyhow, Result};
-use git::GitHostingProviderRegistry;
-
+use anyhow::{anyhow, Context as _, Result};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use ashpd::desktop::trash;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use smol::process::Command;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use std::fs::File;
-#[cfg(unix)]
-use std::os::fd::AsFd;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
+use gpui::App;
+use gpui::Global;
+use gpui::ReadGlobal as _;
+use std::borrow::Cow;
+use util::command::new_std_command;
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 use async_tar::Archive;
 use futures::{future::BoxFuture, AsyncRead, Stream, StreamExt};
 use git::repository::{GitRepository, RealGitRepository};
-use gpui::{AppContext, Global, ReadGlobal};
 use rope::Rope;
 use serde::{Deserialize, Serialize};
 use smol::io::AsyncWriteExt;
@@ -40,12 +34,18 @@ use std::{
 };
 use tempfile::{NamedTempFile, TempDir};
 use text::LineEnding;
-use util::ResultExt;
 
+#[cfg(any(test, feature = "test-support"))]
+mod fake_git_repo;
 #[cfg(any(test, feature = "test-support"))]
 use collections::{btree_map, BTreeMap};
 #[cfg(any(test, feature = "test-support"))]
-use git::repository::{FakeGitRepositoryState, GitFileStatus};
+use fake_git_repo::FakeGitRepositoryState;
+#[cfg(any(test, feature = "test-support"))]
+use git::{
+    repository::RepoPath,
+    status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus},
+};
 #[cfg(any(test, feature = "test-support"))]
 use parking_lot::Mutex;
 #[cfg(any(test, feature = "test-support"))]
@@ -103,7 +103,7 @@ pub trait Fs: Send + Sync {
         self.remove_file(path, options).await
     }
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>>;
-    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read>>;
+    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>>;
     async fn load(&self, path: &Path) -> Result<String> {
         Ok(String::from_utf8(self.load_bytes(path).await?)?)
     }
@@ -129,7 +129,9 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
+    fn home_dir(&self) -> Option<PathBuf>;
     fn open_repo(&self, abs_dot_git: &Path) -> Option<Arc<dyn GitRepository>>;
+    fn git_init(&self, abs_work_directory: &Path, fallback_branch_name: String) -> Result<()>;
     fn is_fake(&self) -> bool;
     async fn is_case_sensitive(&self) -> Result<bool>;
 
@@ -145,12 +147,12 @@ impl Global for GlobalFs {}
 
 impl dyn Fs {
     /// Returns the global [`Fs`].
-    pub fn global(cx: &AppContext) -> Arc<Self> {
+    pub fn global(cx: &App) -> Arc<Self> {
         GlobalFs::global(cx).0.clone()
     }
 
     /// Sets the global [`Fs`].
-    pub fn set_global(fs: Arc<Self>, cx: &mut AppContext) {
+    pub fn set_global(fs: Arc<Self>, cx: &mut App) {
         cx.set_global(GlobalFs(fs));
     }
 }
@@ -240,7 +242,6 @@ impl From<MTime> for proto::Timestamp {
 
 #[derive(Default)]
 pub struct RealFs {
-    git_hosting_provider_registry: Arc<GitHostingProviderRegistry>,
     git_binary_path: Option<PathBuf>,
 }
 
@@ -293,14 +294,8 @@ impl FileHandle for std::fs::File {
 pub struct RealWatcher {}
 
 impl RealFs {
-    pub fn new(
-        git_hosting_provider_registry: Arc<GitHostingProviderRegistry>,
-        git_binary_path: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            git_hosting_provider_registry,
-            git_binary_path,
-        }
+    pub fn new(git_binary_path: Option<PathBuf>) -> Self {
+        Self { git_binary_path }
     }
 }
 
@@ -445,7 +440,13 @@ impl Fs for RealFs {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     async fn trash_file(&self, path: &Path, _options: RemoveOptions) -> Result<()> {
-        let file = File::open(path)?;
+        if let Ok(Some(metadata)) = self.metadata(path).await {
+            if metadata.is_symlink {
+                // TODO: trash_file does not support trashing symlinks yet - https://github.com/bilelmoussaoui/ashpd/issues/255
+                return self.remove_file(path, RemoveOptions::default()).await;
+            }
+        }
+        let file = smol::fs::File::open(path).await?;
         match trash::trash_file(&file.as_fd()).await {
             Ok(_) => Ok(()),
             Err(err) => Err(anyhow::Error::new(err)),
@@ -495,7 +496,7 @@ impl Fs for RealFs {
         Ok(())
     }
 
-    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read>> {
+    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
         Ok(Box::new(std::fs::File::open(path)?))
     }
 
@@ -516,7 +517,24 @@ impl Fs for RealFs {
 
     async fn atomic_write(&self, path: PathBuf, data: String) -> Result<()> {
         smol::unblock(move || {
-            let mut tmp_file = create_temp_file(&path)?;
+            let mut tmp_file = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                // Use the directory of the destination as temp dir to avoid
+                // invalid cross-device link error, and XDG_CACHE_DIR for fallback.
+                // See https://github.com/zed-industries/zed/pull/8437 for more details.
+                NamedTempFile::new_in(path.parent().unwrap_or(paths::temp_dir()))
+            } else if cfg!(target_os = "windows") {
+                // If temp dir is set to a different drive than the destination,
+                // we receive error:
+                //
+                // failed to persist temporary file:
+                // The system cannot move the file to a different disk drive. (os error 17)
+                //
+                // So we use the directory of the destination as a temp dir to avoid it.
+                // https://github.com/zed-industries/zed/issues/16571
+                NamedTempFile::new_in(path.parent().unwrap_or(paths::temp_dir()))
+            } else {
+                NamedTempFile::new()
+            }?;
             tmp_file.write_all(data.as_bytes())?;
             tmp_file.persist(path)?;
             Ok::<(), anyhow::Error>(())
@@ -531,43 +549,13 @@ impl Fs for RealFs {
         if let Some(path) = path.parent() {
             self.create_dir(path).await?;
         }
-        match smol::fs::File::create(path).await {
-            Ok(file) => {
-                let mut writer = smol::io::BufWriter::with_capacity(buffer_size, file);
-                for chunk in chunks(text, line_ending) {
-                    writer.write_all(chunk.as_bytes()).await?;
-                }
-                writer.flush().await?;
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-                    let target_path = path.to_path_buf();
-                    let temp_file = smol::unblock(move || create_temp_file(&target_path)).await?;
-
-                    let temp_path = temp_file.into_temp_path();
-                    let temp_path_for_write = temp_path.to_path_buf();
-
-                    let async_file = smol::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&temp_path)
-                        .await?;
-
-                    let mut writer = smol::io::BufWriter::with_capacity(buffer_size, async_file);
-
-                    for chunk in chunks(text, line_ending) {
-                        writer.write_all(chunk.as_bytes()).await?;
-                    }
-                    writer.flush().await?;
-
-                    write_to_file_as_root(temp_path_for_write, path.to_path_buf()).await
-                } else {
-                    // Todo: Implement for Mac and Windows
-                    Err(e.into())
-                }
-            }
-            Err(e) => Err(e.into()),
+        let file = smol::fs::File::create(path).await?;
+        let mut writer = smol::io::BufWriter::with_capacity(buffer_size, file);
+        for chunk in chunks(text, line_ending) {
+            writer.write_all(chunk.as_bytes()).await?;
         }
+        writer.flush().await?;
+        Ok(())
     }
 
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
@@ -598,11 +586,19 @@ impl Fs for RealFs {
             }
         };
 
+        let path_buf = path.to_path_buf();
+        let path_exists = smol::unblock(move || {
+            path_buf
+                .try_exists()
+                .with_context(|| format!("checking existence for path {path_buf:?}"))
+        })
+        .await?;
         let is_symlink = symlink_metadata.file_type().is_symlink();
-        let metadata = if is_symlink {
-            smol::fs::metadata(path).await?
-        } else {
-            symlink_metadata
+        let metadata = match (is_symlink, path_exists) {
+            (true, true) => smol::fs::metadata(path)
+                .await
+                .with_context(|| "accessing symlink for path {path}")?,
+            _ => symlink_metadata,
         };
 
         #[cfg(unix)]
@@ -695,7 +691,7 @@ impl Fs for RealFs {
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(not(target_os = "macos"))]
     async fn watch(
         &self,
         path: &Path,
@@ -705,10 +701,11 @@ impl Fs for RealFs {
         Arc<dyn Watcher>,
     ) {
         use parking_lot::Mutex;
+        use util::{paths::SanitizedPath, ResultExt as _};
 
         let (tx, rx) = smol::channel::unbounded();
         let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
-        let watcher = Arc::new(linux_watcher::LinuxWatcher::new(tx, pending_paths.clone()));
+        let watcher = Arc::new(fs_watcher::FsWatcher::new(tx, pending_paths.clone()));
 
         if watcher.add(path).is_err() {
             // If the path doesn't exist yet (e.g. settings.json), watch the parent dir to learn when it's created.
@@ -720,7 +717,16 @@ impl Fs for RealFs {
         }
 
         // Check if path is a symlink and follow the target parent
-        if let Some(target) = self.read_link(&path).await.ok() {
+        if let Some(mut target) = self.read_link(&path).await.ok() {
+            // Check if symlink target is relative path, if so make it absolute
+            if target.is_relative() {
+                if let Some(parent) = path.parent() {
+                    target = parent.join(target);
+                    if let Ok(canonical) = self.canonicalize(&target).await {
+                        target = SanitizedPath::from(canonical).as_path().to_path_buf();
+                    }
+                }
+            }
             watcher.add(&target).ok();
             if let Some(parent) = target.parent() {
                 watcher.add(parent).log_err();
@@ -744,66 +750,34 @@ impl Fs for RealFs {
         )
     }
 
-    #[cfg(target_os = "windows")]
-    async fn watch(
-        &self,
-        path: &Path,
-        _latency: Duration,
-    ) -> (
-        Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
-        Arc<dyn Watcher>,
-    ) {
-        use notify::{EventKind, Watcher};
-
-        let (tx, rx) = smol::channel::unbounded();
-
-        let mut file_watcher = notify::recommended_watcher({
-            let tx = tx.clone();
-            move |event: Result<notify::Event, _>| {
-                if let Some(event) = event.log_err() {
-                    let kind = match event.kind {
-                        EventKind::Create(_) => Some(PathEventKind::Created),
-                        EventKind::Modify(_) => Some(PathEventKind::Changed),
-                        EventKind::Remove(_) => Some(PathEventKind::Removed),
-                        _ => None,
-                    };
-
-                    tx.try_send(
-                        event
-                            .paths
-                            .into_iter()
-                            .map(|path| PathEvent { path, kind })
-                            .collect::<Vec<_>>(),
-                    )
-                    .ok();
-                }
-            }
-        })
-        .expect("Could not start file watcher");
-
-        file_watcher
-            .watch(path, notify::RecursiveMode::Recursive)
-            .log_err();
-
-        (
-            Box::pin(rx.chain(futures::stream::once(async move {
-                drop(file_watcher);
-                vec![]
-            }))),
-            Arc::new(RealWatcher {}),
-        )
+    fn open_repo(&self, dotgit_path: &Path) -> Option<Arc<dyn GitRepository>> {
+        Some(Arc::new(RealGitRepository::new(
+            dotgit_path,
+            self.git_binary_path.clone(),
+        )?))
     }
 
-    fn open_repo(&self, dotgit_path: &Path) -> Option<Arc<dyn GitRepository>> {
-        // with libgit2, we can open git repo from an existing work dir
-        // https://libgit2.org/docs/reference/main/repository/git_repository_open.html
-        let workdir_root = dotgit_path.parent()?;
-        let repo = git2::Repository::open(workdir_root).log_err()?;
-        Some(Arc::new(RealGitRepository::new(
-            repo,
-            self.git_binary_path.clone(),
-            self.git_hosting_provider_registry.clone(),
-        )))
+    fn git_init(&self, abs_work_directory_path: &Path, fallback_branch_name: String) -> Result<()> {
+        let config = new_std_command("git")
+            .current_dir(abs_work_directory_path)
+            .args(&["config", "--global", "--get", "init.defaultBranch"])
+            .output()?;
+
+        let branch_name;
+
+        if config.status.success() && !config.stdout.is_empty() {
+            branch_name = String::from_utf8_lossy(&config.stdout);
+        } else {
+            branch_name = Cow::Borrowed(fallback_branch_name.as_str());
+        }
+
+        new_std_command("git")
+            .current_dir(abs_work_directory_path)
+            .args(&["init", "-b"])
+            .arg(branch_name.trim())
+            .output()?;
+
+        Ok(())
     }
 
     fn is_fake(&self) -> bool {
@@ -846,6 +820,10 @@ impl Fs for RealFs {
         temp_dir.close()?;
         case_sensitive
     }
+
+    fn home_dir(&self) -> Option<PathBuf> {
+        Some(paths::home_dir().clone())
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
@@ -879,6 +857,7 @@ struct FakeFsState {
     metadata_call_count: usize,
     read_dir_call_count: usize,
     moves: std::collections::HashMap<u64, PathBuf>,
+    home_dir: Option<PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -895,7 +874,7 @@ enum FakeFsEntry {
         mtime: MTime,
         len: u64,
         entries: BTreeMap<String, Arc<Mutex<FakeFsEntry>>>,
-        git_repo_state: Option<Arc<Mutex<git::repository::FakeGitRepositoryState>>>,
+        git_repo_state: Option<Arc<Mutex<FakeGitRepositoryState>>>,
     },
     Symlink {
         target: PathBuf,
@@ -1042,7 +1021,7 @@ impl FakeFs {
     const SYSTEMTIME_INTERVAL: Duration = Duration::from_nanos(100);
 
     pub fn new(executor: gpui::BackgroundExecutor) -> Arc<Self> {
-        let (tx, mut rx) = smol::channel::bounded::<PathBuf>(10);
+        let (tx, rx) = smol::channel::bounded::<PathBuf>(10);
 
         let this = Arc::new_cyclic(|this| Self {
             this: this.clone(),
@@ -1064,13 +1043,14 @@ impl FakeFs {
                 read_dir_call_count: 0,
                 metadata_call_count: 0,
                 moves: Default::default(),
+                home_dir: None,
             }),
         });
 
         executor.spawn({
             let this = this.clone();
             async move {
-                while let Some(git_event) = rx.next().await {
+                while let Ok(git_event) = rx.recv().await {
                     if let Some(mut state) = this.state.try_lock() {
                         state.emit_event([(git_event, None)]);
                     } else {
@@ -1263,9 +1243,9 @@ impl FakeFs {
         .boxed()
     }
 
-    pub fn with_git_state<F>(&self, dot_git: &Path, emit_git_event: bool, f: F)
+    pub fn with_git_state<T, F>(&self, dot_git: &Path, emit_git_event: bool, f: F) -> T
     where
-        F: FnOnce(&mut FakeGitRepositoryState),
+        F: FnOnce(&mut FakeGitRepositoryState) -> T,
     {
         let mut state = self.state.lock();
         let entry = state.read_path(dot_git).unwrap();
@@ -1280,11 +1260,13 @@ impl FakeFs {
             });
             let mut repo_state = repo_state.lock();
 
-            f(&mut repo_state);
+            let result = f(&mut repo_state);
 
             if emit_git_event {
                 state.emit_event([(dot_git, None)]);
             }
+
+            result
         } else {
             panic!("not a directory");
         }
@@ -1294,7 +1276,7 @@ impl FakeFs {
         self.with_git_state(dot_git, true, |state| {
             let branch = branch.map(Into::into);
             state.branches.extend(branch.clone());
-            state.current_branch_name = branch.map(Into::into)
+            state.current_branch_name = branch
         })
     }
 
@@ -1311,67 +1293,184 @@ impl FakeFs {
         })
     }
 
-    pub fn set_index_for_repo(&self, dot_git: &Path, head_state: &[(&Path, String)]) {
+    pub fn set_unmerged_paths_for_repo(
+        &self,
+        dot_git: &Path,
+        unmerged_state: &[(RepoPath, UnmergedStatus)],
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.unmerged_paths.clear();
+            state.unmerged_paths.extend(
+                unmerged_state
+                    .iter()
+                    .map(|(path, content)| (path.clone(), *content)),
+            );
+        });
+    }
+
+    pub fn set_index_for_repo(&self, dot_git: &Path, index_state: &[(RepoPath, String)]) {
         self.with_git_state(dot_git, true, |state| {
             state.index_contents.clear();
             state.index_contents.extend(
+                index_state
+                    .iter()
+                    .map(|(path, content)| (path.clone(), content.clone())),
+            );
+        });
+    }
+
+    pub fn set_head_for_repo(&self, dot_git: &Path, head_state: &[(RepoPath, String)]) {
+        self.with_git_state(dot_git, true, |state| {
+            state.head_contents.clear();
+            state.head_contents.extend(
                 head_state
                     .iter()
-                    .map(|(path, content)| (path.to_path_buf(), content.clone())),
+                    .map(|(path, content)| (path.clone(), content.clone())),
             );
         });
     }
 
-    pub fn set_blame_for_repo(&self, dot_git: &Path, blames: Vec<(&Path, git::blame::Blame)>) {
+    pub fn set_git_content_for_repo(
+        &self,
+        dot_git: &Path,
+        head_state: &[(RepoPath, String, Option<String>)],
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.head_contents.clear();
+            state.head_contents.extend(
+                head_state
+                    .iter()
+                    .map(|(path, head_content, _)| (path.clone(), head_content.clone())),
+            );
+            state.index_contents.clear();
+            state.index_contents.extend(head_state.iter().map(
+                |(path, head_content, index_content)| {
+                    (
+                        path.clone(),
+                        index_content.as_ref().unwrap_or(head_content).clone(),
+                    )
+                },
+            ));
+        });
+    }
+
+    pub fn set_head_and_index_for_repo(
+        &self,
+        dot_git: &Path,
+        contents_by_path: &[(RepoPath, String)],
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.head_contents.clear();
+            state.index_contents.clear();
+            state.head_contents.extend(contents_by_path.iter().cloned());
+            state
+                .index_contents
+                .extend(contents_by_path.iter().cloned());
+        });
+    }
+
+    pub fn set_blame_for_repo(&self, dot_git: &Path, blames: Vec<(RepoPath, git::blame::Blame)>) {
         self.with_git_state(dot_git, true, |state| {
             state.blames.clear();
-            state.blames.extend(
-                blames
-                    .into_iter()
-                    .map(|(path, blame)| (path.to_path_buf(), blame)),
-            );
+            state.blames.extend(blames);
         });
     }
 
-    pub fn set_status_for_repo_via_working_copy_change(
-        &self,
-        dot_git: &Path,
-        statuses: &[(&Path, GitFileStatus)],
-    ) {
-        self.with_git_state(dot_git, false, |state| {
-            state.worktree_statuses.clear();
-            state.worktree_statuses.extend(
-                statuses
-                    .iter()
-                    .map(|(path, content)| ((**path).into(), *content)),
-            );
-        });
-        self.state.lock().emit_event(
-            statuses
-                .iter()
-                .map(|(path, _)| (dot_git.parent().unwrap().join(path), None)),
-        );
-    }
-
-    pub fn set_status_for_repo_via_git_operation(
-        &self,
-        dot_git: &Path,
-        statuses: &[(&Path, GitFileStatus)],
-    ) {
+    /// Put the given git repository into a state with the given status,
+    /// by mutating the head, index, and unmerged state.
+    pub fn set_status_for_repo(&self, dot_git: &Path, statuses: &[(&Path, FileStatus)]) {
+        let workdir_path = dot_git.parent().unwrap();
+        let workdir_contents = self.files_with_contents(&workdir_path);
         self.with_git_state(dot_git, true, |state| {
-            state.worktree_statuses.clear();
-            state.worktree_statuses.extend(
-                statuses
+            state.index_contents.clear();
+            state.head_contents.clear();
+            state.unmerged_paths.clear();
+            for (path, content) in workdir_contents {
+                let repo_path: RepoPath = path.strip_prefix(&workdir_path).unwrap().into();
+                let status = statuses
                     .iter()
-                    .map(|(path, content)| ((**path).into(), *content)),
-            );
+                    .find_map(|(p, status)| (**p == *repo_path.0).then_some(status));
+                let mut content = String::from_utf8_lossy(&content).to_string();
+
+                let mut index_content = None;
+                let mut head_content = None;
+                match status {
+                    None => {
+                        index_content = Some(content.clone());
+                        head_content = Some(content);
+                    }
+                    Some(FileStatus::Untracked | FileStatus::Ignored) => {}
+                    Some(FileStatus::Unmerged(unmerged_status)) => {
+                        state
+                            .unmerged_paths
+                            .insert(repo_path.clone(), *unmerged_status);
+                        content.push_str(" (unmerged)");
+                        index_content = Some(content.clone());
+                        head_content = Some(content);
+                    }
+                    Some(FileStatus::Tracked(TrackedStatus {
+                        index_status,
+                        worktree_status,
+                    })) => {
+                        match worktree_status {
+                            StatusCode::Modified => {
+                                let mut content = content.clone();
+                                content.push_str(" (modified in working copy)");
+                                index_content = Some(content);
+                            }
+                            StatusCode::TypeChanged | StatusCode::Unmodified => {
+                                index_content = Some(content.clone());
+                            }
+                            StatusCode::Added => {}
+                            StatusCode::Deleted | StatusCode::Renamed | StatusCode::Copied => {
+                                panic!("cannot create these statuses for an existing file");
+                            }
+                        };
+                        match index_status {
+                            StatusCode::Modified => {
+                                let mut content = index_content.clone().expect(
+                                    "file cannot be both modified in index and created in working copy",
+                                );
+                                content.push_str(" (modified in index)");
+                                head_content = Some(content);
+                            }
+                            StatusCode::TypeChanged | StatusCode::Unmodified => {
+                                head_content = Some(index_content.clone().expect("file cannot be both unmodified in index and created in working copy"));
+                            }
+                            StatusCode::Added => {}
+                            StatusCode::Deleted  => {
+                                head_content = Some("".into());
+                            }
+                            StatusCode::Renamed | StatusCode::Copied => {
+                                panic!("cannot create these statuses for an existing file");
+                            }
+                        };
+                    }
+                };
+
+                if let Some(content) = index_content {
+                    state.index_contents.insert(repo_path.clone(), content);
+                }
+                if let Some(content) = head_content {
+                    state.head_contents.insert(repo_path.clone(), content);
+                }
+            }
+        });
+    }
+
+    pub fn set_error_message_for_index_write(&self, dot_git: &Path, message: Option<String>) {
+        self.with_git_state(dot_git, true, |state| {
+            state.simulated_index_write_error_message = message;
         });
     }
 
     pub fn paths(&self, include_dot_git: bool) -> Vec<PathBuf> {
         let mut result = Vec::new();
         let mut queue = collections::VecDeque::new();
-        queue.push_back((PathBuf::from("/"), self.state.lock().root.clone()));
+        queue.push_back((
+            PathBuf::from(util::path!("/")),
+            self.state.lock().root.clone(),
+        ));
         while let Some((path, entry)) = queue.pop_front() {
             if let FakeFsEntry::Dir { entries, .. } = &*entry.lock() {
                 for (name, entry) in entries {
@@ -1392,7 +1491,10 @@ impl FakeFs {
     pub fn directories(&self, include_dot_git: bool) -> Vec<PathBuf> {
         let mut result = Vec::new();
         let mut queue = collections::VecDeque::new();
-        queue.push_back((PathBuf::from("/"), self.state.lock().root.clone()));
+        queue.push_back((
+            PathBuf::from(util::path!("/")),
+            self.state.lock().root.clone(),
+        ));
         while let Some((path, entry)) = queue.pop_front() {
             if let FakeFsEntry::Dir { entries, .. } = &*entry.lock() {
                 for (name, entry) in entries {
@@ -1413,11 +1515,40 @@ impl FakeFs {
     pub fn files(&self) -> Vec<PathBuf> {
         let mut result = Vec::new();
         let mut queue = collections::VecDeque::new();
-        queue.push_back((PathBuf::from("/"), self.state.lock().root.clone()));
+        queue.push_back((
+            PathBuf::from(util::path!("/")),
+            self.state.lock().root.clone(),
+        ));
         while let Some((path, entry)) = queue.pop_front() {
             let e = entry.lock();
             match &*e {
                 FakeFsEntry::File { .. } => result.push(path),
+                FakeFsEntry::Dir { entries, .. } => {
+                    for (name, entry) in entries {
+                        queue.push_back((path.join(name), entry.clone()));
+                    }
+                }
+                FakeFsEntry::Symlink { .. } => {}
+            }
+        }
+        result
+    }
+
+    pub fn files_with_contents(&self, prefix: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut result = Vec::new();
+        let mut queue = collections::VecDeque::new();
+        queue.push_back((
+            PathBuf::from(util::path!("/")),
+            self.state.lock().root.clone(),
+        ));
+        while let Some((path, entry)) = queue.pop_front() {
+            let e = entry.lock();
+            match &*e {
+                FakeFsEntry::File { content, .. } => {
+                    if path.starts_with(prefix) {
+                        result.push((path, content.clone()));
+                    }
+                }
                 FakeFsEntry::Dir { entries, .. } => {
                     for (name, entry) in entries {
                         queue.push_back((path.join(name), entry.clone()));
@@ -1441,6 +1572,10 @@ impl FakeFs {
 
     fn simulate_random_delay(&self) -> impl futures::Future<Output = ()> {
         self.executor.simulate_random_delay()
+    }
+
+    pub fn set_home_dir(&self, home_dir: PathBuf) {
+        self.state.lock().home_dir = Some(home_dir);
     }
 }
 
@@ -1787,7 +1922,7 @@ impl Fs for FakeFs {
         Ok(())
     }
 
-    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read>> {
+    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
         let bytes = self.load_internal(path).await?;
         Ok(Box::new(io::Cursor::new(bytes)))
     }
@@ -1971,18 +2106,28 @@ impl Fs for FakeFs {
         let entry = state.read_path(abs_dot_git).unwrap();
         let mut entry = entry.lock();
         if let FakeFsEntry::Dir { git_repo_state, .. } = &mut *entry {
-            let state = git_repo_state
-                .get_or_insert_with(|| {
-                    Arc::new(Mutex::new(FakeGitRepositoryState::new(
-                        abs_dot_git.to_path_buf(),
-                        state.git_event_tx.clone(),
-                    )))
-                })
-                .clone();
-            Some(git::repository::FakeGitRepository::open(state))
+            git_repo_state.get_or_insert_with(|| {
+                Arc::new(Mutex::new(FakeGitRepositoryState::new(
+                    abs_dot_git.to_path_buf(),
+                    state.git_event_tx.clone(),
+                )))
+            });
+            Some(Arc::new(fake_git_repo::FakeGitRepository {
+                fs: self.this.upgrade().unwrap(),
+                executor: self.executor.clone(),
+                dot_git_path: abs_dot_git.to_path_buf(),
+            }))
         } else {
             None
         }
+    }
+
+    fn git_init(
+        &self,
+        abs_work_directory_path: &Path,
+        _fallback_branch_name: String,
+    ) -> Result<()> {
+        smol::block_on(self.create_dir(&abs_work_directory_path.join(".git")))
     }
 
     fn is_fake(&self) -> bool {
@@ -1996,6 +2141,10 @@ impl Fs for FakeFs {
     #[cfg(any(test, feature = "test-support"))]
     fn as_fake(&self) -> Arc<FakeFs> {
         self.this.upgrade().unwrap()
+    }
+
+    fn home_dir(&self) -> Option<PathBuf> {
+        self.state.lock().home_dir.clone()
     }
 }
 
@@ -2012,84 +2161,6 @@ fn chunks(rope: &Rope, line_ending: LineEnding) -> impl Iterator<Item = &str> {
             ending.into_iter().chain([line])
         })
     })
-}
-
-fn create_temp_file(path: &Path) -> Result<NamedTempFile> {
-    let temp_file = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-        // Use the directory of the destination as temp dir to avoid
-        // invalid cross-device link error, and XDG_CACHE_DIR for fallback.
-        // See https://github.com/zed-industries/zed/pull/8437 for more details.
-        NamedTempFile::new_in(path.parent().unwrap_or(paths::temp_dir()))?
-    } else if cfg!(target_os = "windows") {
-        // If temp dir is set to a different drive than the destination,
-        // we receive error:
-        //
-        // failed to persist temporary file:
-        // The system cannot move the file to a different disk drive. (os error 17)
-        //
-        // So we use the directory of the destination as a temp dir to avoid it.
-        // https://github.com/zed-industries/zed/issues/16571
-        NamedTempFile::new_in(path.parent().unwrap_or(paths::temp_dir()))?
-    } else {
-        NamedTempFile::new()?
-    };
-
-    Ok(temp_file)
-}
-
-#[cfg(target_os = "macos")]
-async fn write_to_file_as_root(_temp_file_path: PathBuf, _target_file_path: PathBuf) -> Result<()> {
-    unimplemented!("write_to_file_as_root is not implemented")
-}
-
-#[cfg(target_os = "windows")]
-async fn write_to_file_as_root(_temp_file_path: PathBuf, _target_file_path: PathBuf) -> Result<()> {
-    unimplemented!("write_to_file_as_root is not implemented")
-}
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-async fn write_to_file_as_root(temp_file_path: PathBuf, target_file_path: PathBuf) -> Result<()> {
-    use shlex::try_quote;
-    use std::os::unix::fs::PermissionsExt;
-    use which::which;
-
-    let pkexec_path = smol::unblock(|| which("pkexec"))
-        .await
-        .map_err(|_| anyhow::anyhow!("pkexec not found in PATH"))?;
-
-    let script_file = smol::unblock(move || {
-        let script_file = tempfile::Builder::new()
-            .prefix("write-to-file-as-root-")
-            .tempfile_in(paths::temp_dir())?;
-
-        writeln!(
-            script_file.as_file(),
-            "#!/usr/bin/env sh\nset -eu\ncat \"{}\" > \"{}\"",
-            try_quote(&temp_file_path.to_string_lossy())?,
-            try_quote(&target_file_path.to_string_lossy())?
-        )?;
-
-        let mut perms = script_file.as_file().metadata()?.permissions();
-        perms.set_mode(0o700); // rwx------
-        script_file.as_file().set_permissions(perms)?;
-
-        Result::<_>::Ok(script_file)
-    })
-    .await?;
-
-    let script_path = script_file.into_temp_path();
-
-    let output = Command::new(&pkexec_path)
-        .arg("--disable-internal-agent")
-        .arg(&script_path)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("Failed to write to file as root"));
-    }
-
-    Ok(())
 }
 
 pub fn normalize_path(path: &Path) -> PathBuf {
@@ -2119,11 +2190,56 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
-pub fn copy_recursive<'a>(
+pub async fn copy_recursive<'a>(
     fs: &'a dyn Fs,
     source: &'a Path,
     target: &'a Path,
     options: CopyOptions,
+) -> Result<()> {
+    for (is_dir, item) in read_dir_items(fs, source).await? {
+        let Ok(item_relative_path) = item.strip_prefix(source) else {
+            continue;
+        };
+        let target_item = if item_relative_path == Path::new("") {
+            target.to_path_buf()
+        } else {
+            target.join(item_relative_path)
+        };
+        if is_dir {
+            if !options.overwrite && fs.metadata(&target_item).await.is_ok_and(|m| m.is_some()) {
+                if options.ignore_if_exists {
+                    continue;
+                } else {
+                    return Err(anyhow!("{target_item:?} already exists"));
+                }
+            }
+            let _ = fs
+                .remove_dir(
+                    &target_item,
+                    RemoveOptions {
+                        recursive: true,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await;
+            fs.create_dir(&target_item).await?;
+        } else {
+            fs.copy_file(&item, &target_item, options).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_dir_items<'a>(fs: &'a dyn Fs, source: &'a Path) -> Result<Vec<(bool, PathBuf)>> {
+    let mut items = Vec::new();
+    read_recursive(fs, source, &mut items).await?;
+    Ok(items)
+}
+
+fn read_recursive<'a>(
+    fs: &'a dyn Fs,
+    source: &'a Path,
+    output: &'a mut Vec<(bool, PathBuf)>,
 ) -> BoxFuture<'a, Result<()>> {
     use futures::future::FutureExt;
 
@@ -2132,39 +2248,19 @@ pub fn copy_recursive<'a>(
             .metadata(source)
             .await?
             .ok_or_else(|| anyhow!("path does not exist: {}", source.display()))?;
-        if metadata.is_dir {
-            if !options.overwrite && fs.metadata(target).await.is_ok_and(|m| m.is_some()) {
-                if options.ignore_if_exists {
-                    return Ok(());
-                } else {
-                    return Err(anyhow!("{target:?} already exists"));
-                }
-            }
 
-            let _ = fs
-                .remove_dir(
-                    target,
-                    RemoveOptions {
-                        recursive: true,
-                        ignore_if_not_exists: true,
-                    },
-                )
-                .await;
-            fs.create_dir(target).await?;
+        if metadata.is_dir {
+            output.push((true, source.to_path_buf()));
             let mut children = fs.read_dir(source).await?;
             while let Some(child_path) = children.next().await {
                 if let Ok(child_path) = child_path {
-                    if let Some(file_name) = child_path.file_name() {
-                        let child_target_path = target.join(file_name);
-                        copy_recursive(fs, &child_path, &child_target_path, options).await?;
-                    }
+                    read_recursive(fs, &child_path, output).await?;
                 }
             }
-
-            Ok(())
         } else {
-            fs.copy_file(source, target, options).await
+            output.push((false, source.to_path_buf()));
         }
+        Ok(())
     }
     .boxed()
 }
@@ -2206,12 +2302,13 @@ mod tests {
     use super::*;
     use gpui::BackgroundExecutor;
     use serde_json::json;
+    use util::path;
 
     #[gpui::test]
     async fn test_fake_fs(executor: BackgroundExecutor) {
         let fs = FakeFs::new(executor.clone());
         fs.insert_tree(
-            "/root",
+            path!("/root"),
             json!({
                 "dir1": {
                     "a": "A",
@@ -2230,32 +2327,393 @@ mod tests {
         assert_eq!(
             fs.files(),
             vec![
-                PathBuf::from("/root/dir1/a"),
-                PathBuf::from("/root/dir1/b"),
-                PathBuf::from("/root/dir2/c"),
-                PathBuf::from("/root/dir2/dir3/d"),
+                PathBuf::from(path!("/root/dir1/a")),
+                PathBuf::from(path!("/root/dir1/b")),
+                PathBuf::from(path!("/root/dir2/c")),
+                PathBuf::from(path!("/root/dir2/dir3/d")),
             ]
         );
 
-        fs.create_symlink("/root/dir2/link-to-dir3".as_ref(), "./dir3".into())
+        fs.create_symlink(path!("/root/dir2/link-to-dir3").as_ref(), "./dir3".into())
             .await
             .unwrap();
 
         assert_eq!(
-            fs.canonicalize("/root/dir2/link-to-dir3".as_ref())
+            fs.canonicalize(path!("/root/dir2/link-to-dir3").as_ref())
                 .await
                 .unwrap(),
-            PathBuf::from("/root/dir2/dir3"),
+            PathBuf::from(path!("/root/dir2/dir3")),
         );
         assert_eq!(
-            fs.canonicalize("/root/dir2/link-to-dir3/d".as_ref())
+            fs.canonicalize(path!("/root/dir2/link-to-dir3/d").as_ref())
                 .await
                 .unwrap(),
-            PathBuf::from("/root/dir2/dir3/d"),
+            PathBuf::from(path!("/root/dir2/dir3/d")),
         );
         assert_eq!(
-            fs.load("/root/dir2/link-to-dir3/d".as_ref()).await.unwrap(),
+            fs.load(path!("/root/dir2/link-to-dir3/d").as_ref())
+                .await
+                .unwrap(),
             "D",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_recursive_with_single_file(executor: BackgroundExecutor) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(
+            path!("/outer"),
+            json!({
+                "a": "A",
+                "b": "B",
+                "inner": {}
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/a")),
+                PathBuf::from(path!("/outer/b")),
+            ]
+        );
+
+        let source = Path::new(path!("/outer/a"));
+        let target = Path::new(path!("/outer/a copy"));
+        copy_recursive(fs.as_ref(), source, target, Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/a")),
+                PathBuf::from(path!("/outer/a copy")),
+                PathBuf::from(path!("/outer/b")),
+            ]
+        );
+
+        let source = Path::new(path!("/outer/a"));
+        let target = Path::new(path!("/outer/inner/a copy"));
+        copy_recursive(fs.as_ref(), source, target, Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/a")),
+                PathBuf::from(path!("/outer/a copy")),
+                PathBuf::from(path!("/outer/b")),
+                PathBuf::from(path!("/outer/inner/a copy")),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_recursive_with_single_dir(executor: BackgroundExecutor) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(
+            path!("/outer"),
+            json!({
+                "a": "A",
+                "empty": {},
+                "non-empty": {
+                    "b": "B",
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/a")),
+                PathBuf::from(path!("/outer/non-empty/b")),
+            ]
+        );
+        assert_eq!(
+            fs.directories(false),
+            vec![
+                PathBuf::from(path!("/")),
+                PathBuf::from(path!("/outer")),
+                PathBuf::from(path!("/outer/empty")),
+                PathBuf::from(path!("/outer/non-empty")),
+            ]
+        );
+
+        let source = Path::new(path!("/outer/empty"));
+        let target = Path::new(path!("/outer/empty copy"));
+        copy_recursive(fs.as_ref(), source, target, Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/a")),
+                PathBuf::from(path!("/outer/non-empty/b")),
+            ]
+        );
+        assert_eq!(
+            fs.directories(false),
+            vec![
+                PathBuf::from(path!("/")),
+                PathBuf::from(path!("/outer")),
+                PathBuf::from(path!("/outer/empty")),
+                PathBuf::from(path!("/outer/empty copy")),
+                PathBuf::from(path!("/outer/non-empty")),
+            ]
+        );
+
+        let source = Path::new(path!("/outer/non-empty"));
+        let target = Path::new(path!("/outer/non-empty copy"));
+        copy_recursive(fs.as_ref(), source, target, Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/a")),
+                PathBuf::from(path!("/outer/non-empty/b")),
+                PathBuf::from(path!("/outer/non-empty copy/b")),
+            ]
+        );
+        assert_eq!(
+            fs.directories(false),
+            vec![
+                PathBuf::from(path!("/")),
+                PathBuf::from(path!("/outer")),
+                PathBuf::from(path!("/outer/empty")),
+                PathBuf::from(path!("/outer/empty copy")),
+                PathBuf::from(path!("/outer/non-empty")),
+                PathBuf::from(path!("/outer/non-empty copy")),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_recursive(executor: BackgroundExecutor) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(
+            path!("/outer"),
+            json!({
+                "inner1": {
+                    "a": "A",
+                    "b": "B",
+                    "inner3": {
+                        "d": "D",
+                    },
+                    "inner4": {}
+                },
+                "inner2": {
+                    "c": "C",
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/inner3/d")),
+            ]
+        );
+        assert_eq!(
+            fs.directories(false),
+            vec![
+                PathBuf::from(path!("/")),
+                PathBuf::from(path!("/outer")),
+                PathBuf::from(path!("/outer/inner1")),
+                PathBuf::from(path!("/outer/inner2")),
+                PathBuf::from(path!("/outer/inner1/inner3")),
+                PathBuf::from(path!("/outer/inner1/inner4")),
+            ]
+        );
+
+        let source = Path::new(path!("/outer"));
+        let target = Path::new(path!("/outer/inner1/outer"));
+        copy_recursive(fs.as_ref(), source, target, Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/inner3/d")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner1/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/inner3/d")),
+            ]
+        );
+        assert_eq!(
+            fs.directories(false),
+            vec![
+                PathBuf::from(path!("/")),
+                PathBuf::from(path!("/outer")),
+                PathBuf::from(path!("/outer/inner1")),
+                PathBuf::from(path!("/outer/inner2")),
+                PathBuf::from(path!("/outer/inner1/inner3")),
+                PathBuf::from(path!("/outer/inner1/inner4")),
+                PathBuf::from(path!("/outer/inner1/outer")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1")),
+                PathBuf::from(path!("/outer/inner1/outer/inner2")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/inner3")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/inner4")),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_recursive_with_overwriting(executor: BackgroundExecutor) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(
+            path!("/outer"),
+            json!({
+                "inner1": {
+                    "a": "A",
+                    "b": "B",
+                    "outer": {
+                        "inner1": {
+                            "a": "B"
+                        }
+                    }
+                },
+                "inner2": {
+                    "c": "C",
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/a")),
+            ]
+        );
+        assert_eq!(
+            fs.load(path!("/outer/inner1/outer/inner1/a").as_ref())
+                .await
+                .unwrap(),
+            "B",
+        );
+
+        let source = Path::new(path!("/outer"));
+        let target = Path::new(path!("/outer/inner1/outer"));
+        copy_recursive(
+            fs.as_ref(),
+            source,
+            target,
+            CopyOptions {
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner1/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/outer/inner1/a")),
+            ]
+        );
+        assert_eq!(
+            fs.load(path!("/outer/inner1/outer/inner1/a").as_ref())
+                .await
+                .unwrap(),
+            "A"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_recursive_with_ignoring(executor: BackgroundExecutor) {
+        let fs = FakeFs::new(executor.clone());
+        fs.insert_tree(
+            path!("/outer"),
+            json!({
+                "inner1": {
+                    "a": "A",
+                    "b": "B",
+                    "outer": {
+                        "inner1": {
+                            "a": "B"
+                        }
+                    }
+                },
+                "inner2": {
+                    "c": "C",
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/a")),
+            ]
+        );
+        assert_eq!(
+            fs.load(path!("/outer/inner1/outer/inner1/a").as_ref())
+                .await
+                .unwrap(),
+            "B",
+        );
+
+        let source = Path::new(path!("/outer"));
+        let target = Path::new(path!("/outer/inner1/outer"));
+        copy_recursive(
+            fs.as_ref(),
+            source,
+            target,
+            CopyOptions {
+                ignore_if_exists: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs.files(),
+            vec![
+                PathBuf::from(path!("/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/a")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/b")),
+                PathBuf::from(path!("/outer/inner1/outer/inner2/c")),
+                PathBuf::from(path!("/outer/inner1/outer/inner1/outer/inner1/a")),
+            ]
+        );
+        assert_eq!(
+            fs.load(path!("/outer/inner1/outer/inner1/a").as_ref())
+                .await
+                .unwrap(),
+            "B"
         );
     }
 }

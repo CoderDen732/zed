@@ -4,7 +4,9 @@ use collections::HashSet;
 use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs as _};
 use futures::StreamExt as _;
-use gpui::{BackgroundExecutor, Context as _, SemanticVersion, TestAppContext, UpdateGlobal as _};
+use gpui::{
+    AppContext as _, BackgroundExecutor, SemanticVersion, TestAppContext, UpdateGlobal as _,
+};
 use http_client::BlockedHttpClient;
 use language::{
     language_settings::{
@@ -16,7 +18,7 @@ use language::{
 };
 use node_runtime::NodeRuntime;
 use project::{
-    lsp_store::{FormatTarget, FormatTrigger},
+    lsp_store::{FormatTrigger, LspFormatTarget},
     ProjectPath,
 };
 use remote::SshRemoteClient;
@@ -73,7 +75,7 @@ async fn test_sharing_an_ssh_remote_project(
     let remote_http_client = Arc::new(BlockedHttpClient);
     let node = NodeRuntime::unavailable();
     let languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
-    let _headless_project = server_cx.new_model(|cx| {
+    let _headless_project = server_cx.new(|cx| {
         client::init_settings(cx);
         HeadlessProject::new(
             HeadlessAppState {
@@ -229,6 +231,10 @@ async fn test_ssh_collaboration_git_branches(
         .await;
 
     let branches = ["main", "dev", "feature-1"];
+    let branches_set = branches
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
     remote_fs.insert_branches(Path::new("/project/.git"), &branches);
 
     // User A connects to the remote project via SSH.
@@ -236,7 +242,7 @@ async fn test_ssh_collaboration_git_branches(
     let remote_http_client = Arc::new(BlockedHttpClient);
     let node = NodeRuntime::unavailable();
     let languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
-    let headless_project = server_cx.new_model(|cx| {
+    let headless_project = server_cx.new(|cx| {
         client::init_settings(cx);
         HeadlessProject::new(
             HeadlessAppState {
@@ -252,7 +258,7 @@ async fn test_ssh_collaboration_git_branches(
     });
 
     let client_ssh = SshRemoteClient::fake_client(opts, cx_a).await;
-    let (project_a, worktree_id) = client_a
+    let (project_a, _) = client_a
         .build_ssh_project("/project", client_ssh, cx_a)
         .await;
 
@@ -270,68 +276,86 @@ async fn test_ssh_collaboration_git_branches(
     // has some git repositories
     executor.run_until_parked();
 
-    let root_path = ProjectPath::root_path(worktree_id);
+    let repo_b = cx_b.update(|cx| project_b.read(cx).active_repository(cx).unwrap());
 
     let branches_b = cx_b
-        .update(|cx| project_b.update(cx, |project, cx| project.branches(root_path.clone(), cx)))
+        .update(|cx| repo_b.read(cx).branches())
         .await
+        .unwrap()
         .unwrap();
 
     let new_branch = branches[2];
 
     let branches_b = branches_b
         .into_iter()
-        .map(|branch| branch.name)
-        .collect::<Vec<_>>();
+        .map(|branch| branch.name.to_string())
+        .collect::<HashSet<_>>();
 
-    assert_eq!(&branches_b, &branches);
+    assert_eq!(&branches_b, &branches_set);
 
-    cx_b.update(|cx| {
-        project_b.update(cx, |project, cx| {
-            project.update_or_create_branch(root_path.clone(), new_branch.to_string(), cx)
-        })
-    })
-    .await
-    .unwrap();
+    cx_b.update(|cx| repo_b.read(cx).change_branch(new_branch.to_string()))
+        .await
+        .unwrap()
+        .unwrap();
 
     executor.run_until_parked();
 
     let server_branch = server_cx.update(|cx| {
         headless_project.update(cx, |headless_project, cx| {
-            headless_project
-                .worktree_store
-                .update(cx, |worktree_store, cx| {
-                    worktree_store
-                        .current_branch(root_path.clone(), cx)
-                        .unwrap()
-                })
+            headless_project.git_store.update(cx, |git_store, cx| {
+                git_store
+                    .repositories()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .current_branch()
+                    .unwrap()
+                    .clone()
+            })
         })
     });
 
-    assert_eq!(server_branch.as_ref(), branches[2]);
+    assert_eq!(server_branch.name, branches[2]);
 
     // Also try creating a new branch
     cx_b.update(|cx| {
-        project_b.update(cx, |project, cx| {
-            project.update_or_create_branch(root_path.clone(), "totally-new-branch".to_string(), cx)
-        })
+        repo_b
+            .read(cx)
+            .create_branch("totally-new-branch".to_string())
     })
     .await
+    .unwrap()
+    .unwrap();
+
+    cx_b.update(|cx| {
+        repo_b
+            .read(cx)
+            .change_branch("totally-new-branch".to_string())
+    })
+    .await
+    .unwrap()
     .unwrap();
 
     executor.run_until_parked();
 
     let server_branch = server_cx.update(|cx| {
         headless_project.update(cx, |headless_project, cx| {
-            headless_project
-                .worktree_store
-                .update(cx, |worktree_store, cx| {
-                    worktree_store.current_branch(root_path, cx).unwrap()
-                })
+            headless_project.git_store.update(cx, |git_store, cx| {
+                git_store
+                    .repositories()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .current_branch()
+                    .unwrap()
+                    .clone()
+            })
         })
     });
 
-    assert_eq!(server_branch.as_ref(), "totally-new-branch");
+    assert_eq!(server_branch.name, "totally-new-branch");
 }
 
 #[gpui::test]
@@ -394,7 +418,7 @@ async fn test_ssh_collaboration_formatting_with_prettier(
     // User A connects to the remote project via SSH.
     server_cx.update(HeadlessProject::init);
     let remote_http_client = Arc::new(BlockedHttpClient);
-    let _headless_project = server_cx.new_model(|cx| {
+    let _headless_project = server_cx.new(|cx| {
         client::init_settings(cx);
         HeadlessProject::new(
             HeadlessAppState {
@@ -458,7 +482,7 @@ async fn test_ssh_collaboration_formatting_with_prettier(
         });
     });
     let fake_language_server = fake_language_servers.next().await.unwrap();
-    fake_language_server.handle_request::<lsp::request::Formatting, _, _>(|_, _| async move {
+    fake_language_server.set_request_handler::<lsp::request::Formatting, _, _>(|_, _| async move {
         panic!(
             "Unexpected: prettier should be preferred since it's enabled and language supports it"
         )
@@ -468,9 +492,9 @@ async fn test_ssh_collaboration_formatting_with_prettier(
         .update(cx_b, |project, cx| {
             project.format(
                 HashSet::from_iter([buffer_b.clone()]),
+                LspFormatTarget::Buffers,
                 true,
                 FormatTrigger::Save,
-                FormatTarget::Buffer,
                 cx,
             )
         })
@@ -505,9 +529,9 @@ async fn test_ssh_collaboration_formatting_with_prettier(
         .update(cx_a, |project, cx| {
             project.format(
                 HashSet::from_iter([buffer_a.clone()]),
+                LspFormatTarget::Buffers,
                 true,
                 FormatTrigger::Manual,
-                FormatTarget::Buffer,
                 cx,
             )
         })

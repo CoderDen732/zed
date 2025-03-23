@@ -428,17 +428,24 @@ impl DirectWriteState {
                     target_font.fallbacks.as_ref(),
                 )
                 .unwrap_or_else(|| {
-                    let family = self.system_ui_font_name.clone();
-                    log::error!("{} not found, use {} instead.", target_font.family, family);
-                    self.get_font_id_from_font_collection(
-                        family.as_ref(),
-                        target_font.weight,
-                        target_font.style,
-                        &target_font.features,
-                        target_font.fallbacks.as_ref(),
-                        true,
-                    )
-                    .unwrap()
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        panic!("ERROR: {} font not found!", target_font.family);
+                    }
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    {
+                        let family = self.system_ui_font_name.clone();
+                        log::error!("{} not found, use {} instead.", target_font.family, family);
+                        self.get_font_id_from_font_collection(
+                            family.as_ref(),
+                            target_font.weight,
+                            target_font.style,
+                            &target_font.features,
+                            target_font.fallbacks.as_ref(),
+                            true,
+                        )
+                        .unwrap()
+                    }
                 })
             }
         }
@@ -1042,7 +1049,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _measuringmode: DWRITE_MEASURING_MODE,
         glyphrun: *const DWRITE_GLYPH_RUN,
         glyphrundescription: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-        _clientdrawingeffect: Option<&windows::core::IUnknown>,
+        _clientdrawingeffect: windows::core::Ref<windows::core::IUnknown>,
     ) -> windows::core::Result<()> {
         unsafe {
             let glyphrun = &*glyphrun;
@@ -1106,7 +1113,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _baselineoriginx: f32,
         _baselineoriginy: f32,
         _underline: *const DWRITE_UNDERLINE,
-        _clientdrawingeffect: Option<&windows::core::IUnknown>,
+        _clientdrawingeffect: windows::core::Ref<windows::core::IUnknown>,
     ) -> windows::core::Result<()> {
         Err(windows::core::Error::new(
             E_NOTIMPL,
@@ -1120,7 +1127,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _baselineoriginx: f32,
         _baselineoriginy: f32,
         _strikethrough: *const DWRITE_STRIKETHROUGH,
-        _clientdrawingeffect: Option<&windows::core::IUnknown>,
+        _clientdrawingeffect: windows::core::Ref<windows::core::IUnknown>,
     ) -> windows::core::Result<()> {
         Err(windows::core::Error::new(
             E_NOTIMPL,
@@ -1133,10 +1140,10 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _clientdrawingcontext: *const ::core::ffi::c_void,
         _originx: f32,
         _originy: f32,
-        _inlineobject: Option<&IDWriteInlineObject>,
+        _inlineobject: windows::core::Ref<IDWriteInlineObject>,
         _issideways: BOOL,
         _isrighttoleft: BOOL,
-        _clientdrawingeffect: Option<&windows::core::IUnknown>,
+        _clientdrawingeffect: windows::core::Ref<windows::core::IUnknown>,
     ) -> windows::core::Result<()> {
         Err(windows::core::Error::new(
             E_NOTIMPL,

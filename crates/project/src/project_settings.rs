@@ -1,18 +1,23 @@
-use anyhow::Context;
+use anyhow::Context as _;
 use collections::HashMap;
+use dap::adapters::DebugAdapterName;
 use fs::Fs;
-use gpui::{AppContext, AsyncAppContext, BorrowAppContext, EventEmitter, Model, ModelContext};
+use futures::StreamExt as _;
+use gpui::{App, AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Task};
 use lsp::LanguageServerName;
 use paths::{
-    local_settings_file_relative_path, local_tasks_file_relative_path,
-    local_vscode_tasks_file_relative_path, EDITORCONFIG_NAME,
+    local_debug_file_relative_path, local_settings_file_relative_path,
+    local_tasks_file_relative_path, local_vscode_tasks_file_relative_path, EDITORCONFIG_NAME,
 };
-use rpc::{proto, AnyProtoClient, TypedEnvelope};
+use rpc::{
+    proto::{self, FromProto, ToProto},
+    AnyProtoClient, TypedEnvelope,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    parse_json_with_comments, InvalidSettingsError, LocalSettingsKind, Settings, SettingsLocation,
-    SettingsSources, SettingsStore,
+    parse_json_with_comments, watch_config_file, InvalidSettingsError, LocalSettingsKind, Settings,
+    SettingsLocation, SettingsSources, SettingsStore, TaskKind,
 };
 use std::{
     path::{Path, PathBuf},
@@ -24,7 +29,7 @@ use util::ResultExt;
 use worktree::{PathChange, UpdatedEntriesSet, Worktree, WorktreeId};
 
 use crate::{
-    task_store::TaskStore,
+    task_store::{TaskSettingsLocation, TaskStore},
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
 
@@ -40,6 +45,14 @@ pub struct ProjectSettings {
     /// Default: null
     #[serde(default)]
     pub lsp: HashMap<LanguageServerName, LspSettings>,
+
+    /// Configuration for Debugger-related features
+    #[serde(default)]
+    pub dap: HashMap<DebugAdapterName, DapSettings>,
+
+    /// Configuration for Diagnostics-related features.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsSettings,
 
     /// Configuration for Git-related features
     #[serde(default)]
@@ -59,12 +72,18 @@ pub struct ProjectSettings {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct DapSettings {
+    pub binary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NodeBinarySettings {
-    /// The path to the node binary
+    /// The path to the Node binary.
     pub path: Option<String>,
-    ///  The path to the npm binary Zed should use (defaults to .path/../npm)
+    /// The path to the npm binary Zed should use (defaults to `.path/../npm`).
     pub npm_path: Option<String>,
-    /// If disabled, zed will download its own copy of node.
+    /// If disabled, Zed will download its own copy of Node.
     #[serde(default)]
     pub ignore_system_version: Option<bool>,
 }
@@ -80,17 +99,95 @@ pub enum DirenvSettings {
 }
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiagnosticsSettings {
+    /// Whether or not to include warning diagnostics
+    #[serde(default = "true_value")]
+    pub include_warnings: bool,
+
+    /// Settings for showing inline diagnostics
+    #[serde(default)]
+    pub inline: InlineDiagnosticsSettings,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InlineDiagnosticsSettings {
+    /// Whether or not to show inline diagnostics
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether to only show the inline diaganostics after a delay after the
+    /// last editor event.
+    ///
+    /// Default: 150
+    #[serde(default = "default_inline_diagnostics_debounce_ms")]
+    pub update_debounce_ms: u64,
+    /// The amount of padding between the end of the source line and the start
+    /// of the inline diagnostic in units of columns.
+    ///
+    /// Default: 4
+    #[serde(default = "default_inline_diagnostics_padding")]
+    pub padding: u32,
+    /// The minimum column to display inline diagnostics. This setting can be
+    /// used to horizontally align inline diagnostics at some position. Lines
+    /// longer than this value will still push diagnostics further to the right.
+    ///
+    /// Default: 0
+    #[serde(default)]
+    pub min_column: u32,
+
+    #[serde(default)]
+    pub max_severity: Option<DiagnosticSeverity>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl Default for InlineDiagnosticsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            update_debounce_ms: default_inline_diagnostics_debounce_ms(),
+            padding: default_inline_diagnostics_padding(),
+            min_column: 0,
+            max_severity: None,
+        }
+    }
+}
+
+fn default_inline_diagnostics_debounce_ms() -> u64 {
+    150
+}
+
+fn default_inline_diagnostics_padding() -> u32 {
+    4
+}
+
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GitSettings {
     /// Whether or not to show the git gutter.
     ///
     /// Default: tracked_files
     pub git_gutter: Option<GitGutterSetting>,
+    /// Sets the debounce threshold (in milliseconds) after which changes are reflected in the git gutter.
+    ///
+    /// Default: null
     pub gutter_debounce: Option<u64>,
     /// Whether or not to show git blame data inline in
     /// the currently focused line.
     ///
     /// Default: on
     pub inline_blame: Option<InlineBlameSettings>,
+    /// How hunks are displayed visually in the editor.
+    ///
+    /// Default: staged_hollow
+    pub hunk_style: Option<GitHunkStyleSetting>,
 }
 
 impl GitSettings {
@@ -125,6 +222,16 @@ impl GitSettings {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum GitHunkStyleSetting {
+    /// Show unstaged hunks with a filled background and staged hunks hollow.
+    #[default]
+    StagedHollow,
+    /// Show unstaged hunks hollow and staged hunks with a filled background.
+    UnstagedHollow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum GitGutterSetting {
     /// Show git gutter in tracked files.
     #[default]
@@ -154,7 +261,7 @@ pub struct InlineBlameSettings {
     /// Whether to show commit summary as part of the inline blame.
     ///
     /// Default: false
-    #[serde(default = "false_value")]
+    #[serde(default)]
     pub show_commit_summary: bool,
 }
 
@@ -162,14 +269,12 @@ const fn true_value() -> bool {
     true
 }
 
-const fn false_value() -> bool {
-    false
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct BinarySettings {
     pub path: Option<String>,
     pub arguments: Option<Vec<String>>,
+    // this can't be an FxHashMap because the extension APIs require the default SipHash
+    pub env: Option<std::collections::HashMap<String, String, std::hash::RandomState>>,
     pub ignore_system_version: Option<bool>,
 }
 
@@ -205,10 +310,7 @@ impl Settings for ProjectSettings {
 
     type FileContent = Self;
 
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut AppContext,
-    ) -> anyhow::Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> anyhow::Result<Self> {
         sources.json_merge()
     }
 }
@@ -220,7 +322,8 @@ pub enum SettingsObserverMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingsObserverEvent {
-    LocalSettingsUpdated(Result<(), InvalidSettingsError>),
+    LocalSettingsUpdated(Result<PathBuf, InvalidSettingsError>),
+    LocalTasksUpdated(Result<PathBuf, InvalidSettingsError>),
 }
 
 impl EventEmitter<SettingsObserverEvent> for SettingsObserver {}
@@ -228,9 +331,10 @@ impl EventEmitter<SettingsObserverEvent> for SettingsObserver {}
 pub struct SettingsObserver {
     mode: SettingsObserverMode,
     downstream_client: Option<AnyProtoClient>,
-    worktree_store: Model<WorktreeStore>,
+    worktree_store: Entity<WorktreeStore>,
     project_id: u64,
-    task_store: Model<TaskStore>,
+    task_store: Entity<TaskStore>,
+    _global_task_config_watchers: (Task<()>, Task<()>),
 }
 
 /// SettingsObserver observers changes to .zed/{settings, task}.json files in local worktrees
@@ -240,14 +344,14 @@ pub struct SettingsObserver {
 /// upstream.
 impl SettingsObserver {
     pub fn init(client: &AnyProtoClient) {
-        client.add_model_message_handler(Self::handle_update_worktree_settings);
+        client.add_entity_message_handler(Self::handle_update_worktree_settings);
     }
 
     pub fn new_local(
         fs: Arc<dyn Fs>,
-        worktree_store: Model<WorktreeStore>,
-        task_store: Model<TaskStore>,
-        cx: &mut ModelContext<Self>,
+        worktree_store: Entity<WorktreeStore>,
+        task_store: Entity<TaskStore>,
+        cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&worktree_store, Self::on_worktree_store_event)
             .detach();
@@ -255,16 +359,31 @@ impl SettingsObserver {
         Self {
             worktree_store,
             task_store,
-            mode: SettingsObserverMode::Local(fs),
+            mode: SettingsObserverMode::Local(fs.clone()),
             downstream_client: None,
             project_id: 0,
+            _global_task_config_watchers: (
+                Self::subscribe_to_global_task_file_changes(
+                    fs.clone(),
+                    TaskKind::Script,
+                    paths::tasks_file().clone(),
+                    cx,
+                ),
+                Self::subscribe_to_global_task_file_changes(
+                    fs,
+                    TaskKind::Debug,
+                    paths::debug_tasks_file().clone(),
+                    cx,
+                ),
+            ),
         }
     }
 
     pub fn new_remote(
-        worktree_store: Model<WorktreeStore>,
-        task_store: Model<TaskStore>,
-        _: &mut ModelContext<Self>,
+        fs: Arc<dyn Fs>,
+        worktree_store: Entity<WorktreeStore>,
+        task_store: Entity<TaskStore>,
+        cx: &mut Context<Self>,
     ) -> Self {
         Self {
             worktree_store,
@@ -272,6 +391,20 @@ impl SettingsObserver {
             mode: SettingsObserverMode::Remote,
             downstream_client: None,
             project_id: 0,
+            _global_task_config_watchers: (
+                Self::subscribe_to_global_task_file_changes(
+                    fs.clone(),
+                    TaskKind::Script,
+                    paths::tasks_file().clone(),
+                    cx,
+                ),
+                Self::subscribe_to_global_task_file_changes(
+                    fs.clone(),
+                    TaskKind::Debug,
+                    paths::debug_tasks_file().clone(),
+                    cx,
+                ),
+            ),
         }
     }
 
@@ -279,7 +412,7 @@ impl SettingsObserver {
         &mut self,
         project_id: u64,
         downstream_client: AnyProtoClient,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.project_id = project_id;
         self.downstream_client = Some(downstream_client.clone());
@@ -292,7 +425,7 @@ impl SettingsObserver {
                     .send(proto::UpdateWorktreeSettings {
                         project_id,
                         worktree_id,
-                        path: path.to_string_lossy().into(),
+                        path: path.to_proto(),
                         content: Some(content),
                         kind: Some(
                             local_settings_kind_to_proto(LocalSettingsKind::Settings).into(),
@@ -305,7 +438,7 @@ impl SettingsObserver {
                     .send(proto::UpdateWorktreeSettings {
                         project_id,
                         worktree_id,
-                        path: path.to_string_lossy().into(),
+                        path: path.to_proto(),
                         content: Some(content),
                         kind: Some(
                             local_settings_kind_to_proto(LocalSettingsKind::Editorconfig).into(),
@@ -316,14 +449,14 @@ impl SettingsObserver {
         }
     }
 
-    pub fn unshared(&mut self, _: &mut ModelContext<Self>) {
+    pub fn unshared(&mut self, _: &mut Context<Self>) {
         self.downstream_client = None;
     }
 
     async fn handle_update_worktree_settings(
-        this: Model<Self>,
+        this: Entity<Self>,
         envelope: TypedEnvelope<proto::UpdateWorktreeSettings>,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> anyhow::Result<()> {
         let kind = match envelope.payload.kind {
             Some(kind) => proto::LocalSettingsKind::from_i32(kind)
@@ -343,7 +476,7 @@ impl SettingsObserver {
             this.update_settings(
                 worktree,
                 [(
-                    PathBuf::from(&envelope.payload.path).into(),
+                    Arc::<Path>::from_proto(envelope.payload.path.clone()),
                     local_settings_kind_from_proto(kind),
                     envelope.payload.content,
                 )],
@@ -355,9 +488,9 @@ impl SettingsObserver {
 
     fn on_worktree_store_event(
         &mut self,
-        _: Model<WorktreeStore>,
+        _: Entity<WorktreeStore>,
         event: &WorktreeStoreEvent,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         if let WorktreeStoreEvent::WorktreeAdded(worktree) = event {
             cx.subscribe(worktree, |this, worktree, event, cx| {
@@ -371,9 +504,9 @@ impl SettingsObserver {
 
     fn update_local_worktree_settings(
         &mut self,
-        worktree: &Model<Worktree>,
+        worktree: &Entity<Worktree>,
         changes: &UpdatedEntriesSet,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         let SettingsObserverMode::Local(fs) = &self.mode else {
             return;
@@ -399,7 +532,7 @@ impl SettingsObserver {
                         )
                         .unwrap(),
                 );
-                (settings_dir, LocalSettingsKind::Tasks)
+                (settings_dir, LocalSettingsKind::Tasks(TaskKind::Script))
             } else if path.ends_with(local_vscode_tasks_file_relative_path()) {
                 let settings_dir = Arc::<Path>::from(
                     path.ancestors()
@@ -411,7 +544,19 @@ impl SettingsObserver {
                         )
                         .unwrap(),
                 );
-                (settings_dir, LocalSettingsKind::Tasks)
+                (settings_dir, LocalSettingsKind::Tasks(TaskKind::Script))
+            } else if path.ends_with(local_debug_file_relative_path()) {
+                let settings_dir = Arc::<Path>::from(
+                    path.ancestors()
+                        .nth(
+                            local_debug_file_relative_path()
+                                .components()
+                                .count()
+                                .saturating_sub(1),
+                        )
+                        .unwrap(),
+                );
+                (settings_dir, LocalSettingsKind::Tasks(TaskKind::Debug))
             } else if path.ends_with(EDITORCONFIG_NAME) {
                 let Some(settings_dir) = path.parent().map(Arc::from) else {
                     continue;
@@ -473,7 +618,7 @@ impl SettingsObserver {
         }
 
         let worktree = worktree.clone();
-        cx.spawn(move |this, cx| async move {
+        cx.spawn(async move |this, cx| {
             let settings_contents: Vec<(Arc<Path>, _, _)> =
                 futures::future::join_all(settings_contents).await;
             cx.update(|cx| {
@@ -493,9 +638,9 @@ impl SettingsObserver {
 
     fn update_settings(
         &mut self,
-        worktree: Model<Worktree>,
+        worktree: Entity<Worktree>,
         settings_contents: impl IntoIterator<Item = (Arc<Path>, LocalSettingsKind, Option<String>)>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         let worktree_id = worktree.read(cx).id();
         let remote_worktree_id = worktree.read(cx).id();
@@ -515,11 +660,7 @@ impl SettingsObserver {
 
                         match result {
                             Err(InvalidSettingsError::LocalSettings { path, message }) => {
-                                log::error!(
-                                    "Failed to set local settings in {:?}: {:?}",
-                                    path,
-                                    message
-                                );
+                                log::error!("Failed to set local settings in {path:?}: {message}");
                                 cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Err(
                                     InvalidSettingsError::LocalSettings { path, message },
                                 )));
@@ -527,23 +668,43 @@ impl SettingsObserver {
                             Err(e) => {
                                 log::error!("Failed to set local settings: {e}");
                             }
-                            Ok(_) => {
-                                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Ok(())));
+                            Ok(()) => {
+                                cx.emit(SettingsObserverEvent::LocalSettingsUpdated(Ok(
+                                    directory.join(local_settings_file_relative_path())
+                                )));
                             }
                         }
                     }),
-                LocalSettingsKind::Tasks => task_store.update(cx, |task_store, cx| {
-                    task_store
-                        .update_user_tasks(
-                            Some(SettingsLocation {
+                LocalSettingsKind::Tasks(task_kind) => {
+                    let result = task_store.update(cx, |task_store, cx| {
+                        task_store.update_user_tasks(
+                            TaskSettingsLocation::Worktree(SettingsLocation {
                                 worktree_id,
                                 path: directory.as_ref(),
                             }),
                             file_content.as_deref(),
+                            task_kind,
                             cx,
                         )
-                        .log_err();
-                }),
+                    });
+
+                    match result {
+                        Err(InvalidSettingsError::Tasks { path, message }) => {
+                            log::error!("Failed to set local tasks in {path:?}: {message:?}");
+                            cx.emit(SettingsObserverEvent::LocalTasksUpdated(Err(
+                                InvalidSettingsError::Tasks { path, message },
+                            )));
+                        }
+                        Err(e) => {
+                            log::error!("Failed to set local tasks: {e}");
+                        }
+                        Ok(()) => {
+                            cx.emit(SettingsObserverEvent::LocalTasksUpdated(Ok(
+                                task_kind.config_in_dir(&directory)
+                            )));
+                        }
+                    }
+                }
             };
 
             if let Some(downstream_client) = &self.downstream_client {
@@ -551,7 +712,7 @@ impl SettingsObserver {
                     .send(proto::UpdateWorktreeSettings {
                         project_id: self.project_id,
                         worktree_id: remote_worktree_id.to_proto(),
-                        path: directory.to_string_lossy().into_owned(),
+                        path: directory.to_proto(),
                         content: file_content,
                         kind: Some(local_settings_kind_to_proto(kind).into()),
                     })
@@ -559,12 +720,71 @@ impl SettingsObserver {
             }
         }
     }
+
+    fn subscribe_to_global_task_file_changes(
+        fs: Arc<dyn Fs>,
+        task_kind: TaskKind,
+        file_path: PathBuf,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<()> {
+        let mut user_tasks_file_rx =
+            watch_config_file(&cx.background_executor(), fs, file_path.clone());
+        let user_tasks_content = cx.background_executor().block(user_tasks_file_rx.next());
+        let weak_entry = cx.weak_entity();
+        cx.spawn(async move |settings_observer, cx| {
+            let Ok(task_store) = settings_observer.update(cx, |settings_observer, _| {
+                settings_observer.task_store.clone()
+            }) else {
+                return;
+            };
+            if let Some(user_tasks_content) = user_tasks_content {
+                let Ok(()) = task_store.update(cx, |task_store, cx| {
+                    task_store
+                        .update_user_tasks(
+                            TaskSettingsLocation::Global(&file_path),
+                            Some(&user_tasks_content),
+                            task_kind,
+                            cx,
+                        )
+                        .log_err();
+                }) else {
+                    return;
+                };
+            }
+            while let Some(user_tasks_content) = user_tasks_file_rx.next().await {
+                let Ok(result) = task_store.update(cx, |task_store, cx| {
+                    task_store.update_user_tasks(
+                        TaskSettingsLocation::Global(&file_path),
+                        Some(&user_tasks_content),
+                        task_kind,
+                        cx,
+                    )
+                }) else {
+                    break;
+                };
+
+                weak_entry
+                    .update(cx, |_, cx| match result {
+                        Ok(()) => cx.emit(SettingsObserverEvent::LocalTasksUpdated(Ok(
+                            file_path.clone()
+                        ))),
+                        Err(err) => cx.emit(SettingsObserverEvent::LocalTasksUpdated(Err(
+                            InvalidSettingsError::Tasks {
+                                path: file_path.clone(),
+                                message: err.to_string(),
+                            },
+                        ))),
+                    })
+                    .ok();
+            }
+        })
+    }
 }
 
 pub fn local_settings_kind_from_proto(kind: proto::LocalSettingsKind) -> LocalSettingsKind {
     match kind {
         proto::LocalSettingsKind::Settings => LocalSettingsKind::Settings,
-        proto::LocalSettingsKind::Tasks => LocalSettingsKind::Tasks,
+        proto::LocalSettingsKind::Tasks => LocalSettingsKind::Tasks(TaskKind::Script),
         proto::LocalSettingsKind::Editorconfig => LocalSettingsKind::Editorconfig,
     }
 }
@@ -572,7 +792,7 @@ pub fn local_settings_kind_from_proto(kind: proto::LocalSettingsKind) -> LocalSe
 pub fn local_settings_kind_to_proto(kind: LocalSettingsKind) -> proto::LocalSettingsKind {
     match kind {
         LocalSettingsKind::Settings => proto::LocalSettingsKind::Settings,
-        LocalSettingsKind::Tasks => proto::LocalSettingsKind::Tasks,
+        LocalSettingsKind::Tasks(_) => proto::LocalSettingsKind::Tasks,
         LocalSettingsKind::Editorconfig => proto::LocalSettingsKind::Editorconfig,
     }
 }

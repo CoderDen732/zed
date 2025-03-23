@@ -23,6 +23,8 @@ They both have an overlapping feature set of autocomplete, diagnostics, code act
 
 In addition to these two language servers, Zed also supports [rubocop](https://github.com/rubocop/rubocop) which is a static code analyzer and linter for Ruby. Under the hood, it's also used by Zed as a language server, but its functionality is complimentary to that of solargraph and ruby-lsp.
 
+When configuring a language server, it helps to open the LSP Logs window using the 'debug: open language server logs' command. You can then choose the corresponding language instance to see any logged information.
+
 ## Configuring a language server
 
 The [Ruby extension](https://github.com/zed-extensions/ruby) offers both `solargraph` and `ruby-lsp` language server support.
@@ -106,14 +108,14 @@ Solargraph has formatting and diagnostics disabled by default. We can tell Zed t
 }
 ```
 
-To use Solargraph in the context of the bundle, you can use [folder-specific settings](../configuring-zed.md#settings-files) and specify the absolute path to the [`binstub`](https://bundler.io/v2.5/man/bundle-binstubs.1.html) of Solargraph:
+By default, Solargraph uses `bundle exec` to run in the context of the bundle. To disable that, you can use the `use_bundler` configuration option:
 
 ```json
 {
   "lsp": {
     "solargraph": {
-      "binary": {
-        "path": "<path_to_your_project>/bin/solargraph"
+      "settings": {
+        "use_bundler": false
       }
     }
   }
@@ -150,6 +152,20 @@ Ruby LSP uses pull-based diagnostics which Zed doesn't support yet. We can tell 
           // This disables diagnostics
           "diagnostics": false
         }
+      }
+    }
+  }
+}
+```
+
+By default, Ruby LSP does not use `bundle exec` to run in the context of the bundle. To enable that, you can use the `use_bundler` configuration option:
+
+```json
+{
+  "lsp": {
+    "ruby-lsp": {
+      "settings": {
+        "use_bundler": true
       }
     }
   }
@@ -193,14 +209,14 @@ Rubocop has unsafe autocorrection disabled by default. We can tell Zed to enable
 }
 ```
 
-To use Rubocop in the context of the bundle, you can use [folder-specific settings](../configuring-zed.md#settings-files) and specify the absolute path to the [`binstub`](https://bundler.io/v2.5/man/bundle-binstubs.1.html) of Rubocop:
+By default, `rubocop` uses `bundle exec` to run in the context of the bundle. To disable that, you can use the `use_bundler` configuration option:
 
 ```json
 {
   "lsp": {
     "rubocop": {
-      "binary": {
-        "path": "<path_to_your_project>/bin/rubocop"
+      "settings": {
+        "use_bundler": false
       }
     }
   }
@@ -255,7 +271,7 @@ end
 
 To run tests in your Ruby project, you can set up custom tasks in your local `.zed/tasks.json` configuration file. These tasks can be defined to work with different test frameworks like Minitest, RSpec, quickdraw, and tldr. Below are some examples of how to set up these tasks to run your tests from within your editor.
 
-### Minitest
+### Minitest with Rails
 
 ```json
 [
@@ -267,6 +283,8 @@ To run tests in your Ruby project, you can set up custom tasks in your local `.z
   }
 ]
 ```
+
+Note: Plain minitest does not support running tests by line number.
 
 ### RSpec
 

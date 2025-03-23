@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use collections::HashMap;
 use command_palette_hooks::CommandPaletteFilter;
-use gpui::{AsyncAppContext, EventEmitter, Model, ModelContext, Subscription, Task, WeakModel};
+use gpui::{AsyncApp, Context, Entity, EventEmitter, Subscription, Task, WeakEntity};
 use log;
 use parking_lot::RwLock;
 use project::Project;
@@ -61,7 +61,7 @@ impl ContextServer {
         self.client.read().clone()
     }
 
-    pub async fn start(self: Arc<Self>, cx: &AsyncAppContext) -> Result<()> {
+    pub async fn start(self: Arc<Self>, cx: &AsyncApp) -> Result<()> {
         log::info!("starting context server {}", self.id);
         let Some(command) = &self.config.command else {
             bail!("no command specified for server {}", self.id);
@@ -104,8 +104,8 @@ impl ContextServer {
 
 pub struct ContextServerManager {
     servers: HashMap<Arc<str>, Arc<ContextServer>>,
-    project: Model<Project>,
-    registry: Model<ContextServerFactoryRegistry>,
+    project: Entity<Project>,
+    registry: Entity<ContextServerFactoryRegistry>,
     update_servers_task: Option<Task<Result<()>>>,
     needs_server_update: bool,
     _subscriptions: Vec<Subscription>,
@@ -120,9 +120,9 @@ impl EventEmitter<Event> for ContextServerManager {}
 
 impl ContextServerManager {
     pub fn new(
-        registry: Model<ContextServerFactoryRegistry>,
-        project: Model<Project>,
-        cx: &mut ModelContext<Self>,
+        registry: Entity<ContextServerFactoryRegistry>,
+        project: Entity<Project>,
+        cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
             _subscriptions: vec![
@@ -143,19 +143,19 @@ impl ContextServerManager {
         this
     }
 
-    fn available_context_servers_changed(&mut self, cx: &mut ModelContext<Self>) {
+    fn available_context_servers_changed(&mut self, cx: &mut Context<Self>) {
         if self.update_servers_task.is_some() {
             self.needs_server_update = true;
         } else {
-            self.update_servers_task = Some(cx.spawn(|this, mut cx| async move {
-                this.update(&mut cx, |this, _| {
+            self.update_servers_task = Some(cx.spawn(async move |this, cx| {
+                this.update(cx, |this, _| {
                     this.needs_server_update = false;
                 })?;
 
-                Self::maintain_servers(this.clone(), cx.clone()).await?;
+                Self::maintain_servers(this.clone(), cx).await?;
 
-                this.update(&mut cx, |this, cx| {
-                    let has_any_context_servers = !this.servers().is_empty();
+                this.update(cx, |this, cx| {
+                    let has_any_context_servers = !this.running_servers().is_empty();
                     if has_any_context_servers {
                         CommandPaletteFilter::update_global(cx, |filter, _cx| {
                             filter.show_namespace(CONTEXT_SERVERS_NAMESPACE);
@@ -180,19 +180,44 @@ impl ContextServerManager {
             .cloned()
     }
 
+    pub fn start_server(
+        &self,
+        server: Arc<ContextServer>,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        cx.spawn(async move |this, cx| {
+            let id = server.id.clone();
+            server.start(&cx).await?;
+            this.update(cx, |_, cx| cx.emit(Event::ServerStarted { server_id: id }))?;
+            Ok(())
+        })
+    }
+
+    pub fn stop_server(
+        &self,
+        server: Arc<ContextServer>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        server.stop()?;
+        cx.emit(Event::ServerStopped {
+            server_id: server.id(),
+        });
+        Ok(())
+    }
+
     pub fn restart_server(
         &mut self,
         id: &Arc<str>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let id = id.clone();
-        cx.spawn(|this, mut cx| async move {
-            if let Some(server) = this.update(&mut cx, |this, _cx| this.servers.remove(&id))? {
+        cx.spawn(async move |this, cx| {
+            if let Some(server) = this.update(cx, |this, _cx| this.servers.remove(&id))? {
                 server.stop()?;
                 let config = server.config();
                 let new_server = Arc::new(ContextServer::new(id.clone(), config));
                 new_server.clone().start(&cx).await?;
-                this.update(&mut cx, |this, cx| {
+                this.update(cx, |this, cx| {
                     this.servers.insert(id.clone(), new_server);
                     cx.emit(Event::ServerStopped {
                         server_id: id.clone(),
@@ -206,7 +231,11 @@ impl ContextServerManager {
         })
     }
 
-    pub fn servers(&self) -> Vec<Arc<ContextServer>> {
+    pub fn all_servers(&self) -> Vec<Arc<ContextServer>> {
+        self.servers.values().cloned().collect()
+    }
+
+    pub fn running_servers(&self) -> Vec<Arc<ContextServer>> {
         self.servers
             .values()
             .filter(|server| server.client().is_some())
@@ -214,10 +243,10 @@ impl ContextServerManager {
             .collect()
     }
 
-    async fn maintain_servers(this: WeakModel<Self>, mut cx: AsyncAppContext) -> Result<()> {
+    async fn maintain_servers(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let mut desired_servers = HashMap::default();
 
-        let (registry, project) = this.update(&mut cx, |this, cx| {
+        let (registry, project) = this.update(cx, |this, cx| {
             let location = this.project.read(cx).worktrees(cx).next().map(|worktree| {
                 settings::SettingsLocation {
                     worktree_id: worktree.read(cx).id(),
@@ -231,7 +260,7 @@ impl ContextServerManager {
         })?;
 
         for (id, factory) in
-            registry.read_with(&cx, |registry, _| registry.context_server_factories())?
+            registry.read_with(cx, |registry, _| registry.context_server_factories())?
         {
             let config = desired_servers.entry(id).or_default();
             if config.command.is_none() {
@@ -244,7 +273,7 @@ impl ContextServerManager {
         let mut servers_to_start = HashMap::default();
         let mut servers_to_stop = HashMap::default();
 
-        this.update(&mut cx, |this, _cx| {
+        this.update(cx, |this, _cx| {
             this.servers.retain(|id, server| {
                 if desired_servers.contains_key(id) {
                     true
@@ -270,16 +299,12 @@ impl ContextServerManager {
 
         for (id, server) in servers_to_stop {
             server.stop().log_err();
-            this.update(&mut cx, |_, cx| {
-                cx.emit(Event::ServerStopped { server_id: id })
-            })?;
+            this.update(cx, |_, cx| cx.emit(Event::ServerStopped { server_id: id }))?;
         }
 
         for (id, server) in servers_to_start {
             if server.start(&cx).await.log_err().is_some() {
-                this.update(&mut cx, |_, cx| {
-                    cx.emit(Event::ServerStarted { server_id: id })
-                })?;
+                this.update(cx, |_, cx| cx.emit(Event::ServerStarted { server_id: id }))?;
             }
         }
 

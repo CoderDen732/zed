@@ -6,15 +6,7 @@
     {
       "name": "Gruvbox Dark",
       "appearance": "dark",
-      "accents": [
-        "#cc241dff",
-        "#98971aff",
-        "#d79921ff",
-        "#458588ff",
-        "#b16286ff",
-        "#689d6aff",
-        "#d65d0eff"
-      ],
+      "accents": ["#cc241dff", "#98971aff", "#d79921ff", "#458588ff", "#b16286ff", "#689d6aff", "#d65d0eff"],
       "style": {
         "border": "#5b534dff",
         "border.variant": "#494340ff",
@@ -68,8 +60,9 @@
         "editor.subheader.background": "#3a3735ff",
         "editor.active_line.background": "#3a3735bf",
         "editor.highlighted_line.background": "#3a3735ff",
-        "editor.line_number": "#fbf1c759",
-        "editor.active_line_number": "#fbf1c7ff",
+        "editor.line_number": "#6e6b5e",
+        "editor.active_line_number": "#dedcd3",
+        "editor.hover_line_number": "#c9c5b6",
         "editor.invisible": "#928474ff",
         "editor.wrap_guide": "#fbf1c70d",
         "editor.active_wrap_guide": "#fbf1c71a",
@@ -104,6 +97,9 @@
         "terminal.ansi.bright_white": "#fbf1c7ff",
         "terminal.ansi.dim_white": "#b0a189ff",
         "link_text.hover": "#83a598ff",
+        "version_control.added": "#b7bb26ff",
+        "version_control.modified": "#f9bd2fff",
+        "version_control.deleted": "#fb4a35ff",
         "conflict": "#f9bd2fff",
         "conflict.background": "#572e10ff",
         "conflict.border": "#754916ff",
@@ -375,6 +371,11 @@
             "font_weight": null
           },
           "variable": {
+            "color": "#ebdbb2ff",
+            "font_style": null,
+            "font_weight": null
+          },
+          "variable.special": {
             "color": "#83a598ff",
             "font_style": null,
             "font_weight": null
@@ -390,15 +391,7 @@
     {
       "name": "Gruvbox Dark Hard",
       "appearance": "dark",
-      "accents": [
-        "#cc241dff",
-        "#98971aff",
-        "#d79921ff",
-        "#458588ff",
-        "#b16286ff",
-        "#689d6aff",
-        "#d65d0eff"
-      ],
+      "accents": ["#cc241dff", "#98971aff", "#d79921ff", "#458588ff", "#b16286ff", "#689d6aff", "#d65d0eff"],
       "style": {
         "border": "#5b534dff",
         "border.variant": "#494340ff",
@@ -452,8 +445,9 @@
         "editor.subheader.background": "#393634ff",
         "editor.active_line.background": "#393634bf",
         "editor.highlighted_line.background": "#393634ff",
-        "editor.line_number": "#fbf1c759",
-        "editor.active_line_number": "#fbf1c7ff",
+        "editor.line_number": "#6e6b5e",
+        "editor.active_line_number": "#dedcd3",
+        "editor.hover_line_number": "#c9c5b6",
         "editor.invisible": "#928474ff",
         "editor.wrap_guide": "#fbf1c70d",
         "editor.active_wrap_guide": "#fbf1c71a",
@@ -488,6 +482,9 @@
         "terminal.ansi.bright_white": "#fbf1c7ff",
         "terminal.ansi.dim_white": "#b0a189ff",
         "link_text.hover": "#83a598ff",
+        "version_control.added": "#b7bb26ff",
+        "version_control.modified": "#f9bd2fff",
+        "version_control.deleted": "#fb4a35ff",
         "conflict": "#f9bd2fff",
         "conflict.background": "#572e10ff",
         "conflict.border": "#754916ff",
@@ -759,6 +756,11 @@
             "font_weight": null
           },
           "variable": {
+            "color": "#ebdbb2ff",
+            "font_style": null,
+            "font_weight": null
+          },
+          "variable.special": {
             "color": "#83a598ff",
             "font_style": null,
             "font_weight": null
@@ -774,15 +776,7 @@
     {
       "name": "Gruvbox Dark Soft",
       "appearance": "dark",
-      "accents": [
-        "#cc241dff",
-        "#98971aff",
-        "#d79921ff",
-        "#458588ff",
-        "#b16286ff",
-        "#689d6aff",
-        "#d65d0eff"
-      ],
+      "accents": ["#cc241dff", "#98971aff", "#d79921ff", "#458588ff", "#b16286ff", "#689d6aff", "#d65d0eff"],
       "style": {
         "border": "#5b534dff",
         "border.variant": "#494340ff",
@@ -836,8 +830,9 @@
         "editor.subheader.background": "#3b3735ff",
         "editor.active_line.background": "#3b3735bf",
         "editor.highlighted_line.background": "#3b3735ff",
-        "editor.line_number": "#fbf1c759",
-        "editor.active_line_number": "#fbf1c7ff",
+        "editor.line_number": "#6e6b5e",
+        "editor.active_line_number": "#dedcd3",
+        "editor.hover_line_number": "#c9c5b6",
         "editor.invisible": "#928474ff",
         "editor.wrap_guide": "#fbf1c70d",
         "editor.active_wrap_guide": "#fbf1c71a",
@@ -872,6 +867,9 @@
         "terminal.ansi.bright_white": "#fbf1c7ff",
         "terminal.ansi.dim_white": "#b0a189ff",
         "link_text.hover": "#83a598ff",
+        "version_control.added": "#b7bb26ff",
+        "version_control.modified": "#f9bd2fff",
+        "version_control.deleted": "#fb4a35ff",
         "conflict": "#f9bd2fff",
         "conflict.background": "#572e10ff",
         "conflict.border": "#754916ff",
@@ -1143,6 +1141,11 @@
             "font_weight": null
           },
           "variable": {
+            "color": "#ebdbb2ff",
+            "font_style": null,
+            "font_weight": null
+          },
+          "variable.special": {
             "color": "#83a598ff",
             "font_style": null,
             "font_weight": null
@@ -1158,15 +1161,7 @@
     {
       "name": "Gruvbox Light",
       "appearance": "light",
-      "accents": [
-        "#cc241dff",
-        "#98971aff",
-        "#d79921ff",
-        "#458588ff",
-        "#b16286ff",
-        "#689d6aff",
-        "#d65d0eff"
-      ],
+      "accents": ["#cc241dff", "#98971aff", "#d79921ff", "#458588ff", "#b16286ff", "#689d6aff", "#d65d0eff"],
       "style": {
         "border": "#c8b899ff",
         "border.variant": "#ddcca7ff",
@@ -1220,8 +1215,9 @@
         "editor.subheader.background": "#ecddb4ff",
         "editor.active_line.background": "#ecddb4bf",
         "editor.highlighted_line.background": "#ecddb4ff",
-        "editor.line_number": "#28282859",
-        "editor.active_line_number": "#282828ff",
+        "editor.line_number": "#a9a389",
+        "editor.active_line_number": "#3b382b",
+        "editor.hover_line_number": "#5e5a45",
         "editor.invisible": "#928474ff",
         "editor.wrap_guide": "#2828280d",
         "editor.active_wrap_guide": "#2828281a",
@@ -1256,6 +1252,9 @@
         "terminal.ansi.bright_white": "#282828ff",
         "terminal.ansi.dim_white": "#73675eff",
         "link_text.hover": "#0b6678ff",
+        "version_control.added": "#797410ff",
+        "version_control.modified": "#b57615ff",
+        "version_control.deleted": "#9d0308ff",
         "conflict": "#b57615ff",
         "conflict.background": "#f5e2d0ff",
         "conflict.border": "#ebccabff",
@@ -1527,6 +1526,11 @@
             "font_weight": null
           },
           "variable": {
+            "color": "#282828ff",
+            "font_style": null,
+            "font_weight": null
+          },
+          "variable.special": {
             "color": "#066578ff",
             "font_style": null,
             "font_weight": null
@@ -1542,15 +1546,7 @@
     {
       "name": "Gruvbox Light Hard",
       "appearance": "light",
-      "accents": [
-        "#cc241dff",
-        "#98971aff",
-        "#d79921ff",
-        "#458588ff",
-        "#b16286ff",
-        "#689d6aff",
-        "#d65d0eff"
-      ],
+      "accents": ["#cc241dff", "#98971aff", "#d79921ff", "#458588ff", "#b16286ff", "#689d6aff", "#d65d0eff"],
       "style": {
         "border": "#c8b899ff",
         "border.variant": "#ddcca7ff",
@@ -1604,8 +1600,9 @@
         "editor.subheader.background": "#ecddb5ff",
         "editor.active_line.background": "#ecddb5bf",
         "editor.highlighted_line.background": "#ecddb5ff",
-        "editor.line_number": "#28282859",
-        "editor.active_line_number": "#282828ff",
+        "editor.line_number": "#a9a389",
+        "editor.active_line_number": "#3b382b",
+        "editor.hover_line_number": "#5e5a45",
         "editor.invisible": "#928474ff",
         "editor.wrap_guide": "#2828280d",
         "editor.active_wrap_guide": "#2828281a",
@@ -1640,6 +1637,9 @@
         "terminal.ansi.bright_white": "#282828ff",
         "terminal.ansi.dim_white": "#73675eff",
         "link_text.hover": "#0b6678ff",
+        "version_control.added": "#797410ff",
+        "version_control.modified": "#b57615ff",
+        "version_control.deleted": "#9d0308ff",
         "conflict": "#b57615ff",
         "conflict.background": "#f5e2d0ff",
         "conflict.border": "#ebccabff",
@@ -1911,6 +1911,11 @@
             "font_weight": null
           },
           "variable": {
+            "color": "#282828ff",
+            "font_style": null,
+            "font_weight": null
+          },
+          "variable.special": {
             "color": "#066578ff",
             "font_style": null,
             "font_weight": null
@@ -1926,15 +1931,7 @@
     {
       "name": "Gruvbox Light Soft",
       "appearance": "light",
-      "accents": [
-        "#cc241dff",
-        "#98971aff",
-        "#d79921ff",
-        "#458588ff",
-        "#b16286ff",
-        "#689d6aff",
-        "#d65d0eff"
-      ],
+      "accents": ["#cc241dff", "#98971aff", "#d79921ff", "#458588ff", "#b16286ff", "#689d6aff", "#d65d0eff"],
       "style": {
         "border": "#c8b899ff",
         "border.variant": "#ddcca7ff",
@@ -1988,8 +1985,9 @@
         "editor.subheader.background": "#ecdcb3ff",
         "editor.active_line.background": "#ecdcb3bf",
         "editor.highlighted_line.background": "#ecdcb3ff",
-        "editor.line_number": "#28282859",
-        "editor.active_line_number": "#282828ff",
+        "editor.line_number": "#a9a389",
+        "editor.active_line_number": "#3b382b",
+        "editor.hover_line_number": "#5e5a45",
         "editor.invisible": "#928474ff",
         "editor.wrap_guide": "#2828280d",
         "editor.active_wrap_guide": "#2828281a",
@@ -2024,6 +2022,9 @@
         "terminal.ansi.bright_white": "#282828ff",
         "terminal.ansi.dim_white": "#73675eff",
         "link_text.hover": "#0b6678ff",
+        "version_control.added": "#797410ff",
+        "version_control.modified": "#b57615ff",
+        "version_control.deleted": "#9d0308ff",
         "conflict": "#b57615ff",
         "conflict.background": "#f5e2d0ff",
         "conflict.border": "#ebccabff",
@@ -2295,6 +2296,11 @@
             "font_weight": null
           },
           "variable": {
+            "color": "#282828ff",
+            "font_style": null,
+            "font_weight": null
+          },
+          "variable.special": {
             "color": "#066578ff",
             "font_style": null,
             "font_weight": null

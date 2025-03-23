@@ -8,9 +8,9 @@ use collections::BTreeMap;
 use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs, RealFs};
 use futures::{io::BufReader, AsyncReadExt, StreamExt};
-use gpui::{Context, SemanticVersion, TestAppContext};
+use gpui::{AppContext as _, SemanticVersion, SharedString, TestAppContext};
 use http_client::{FakeHttpClient, Response};
-use language::{LanguageMatcher, LanguageRegistry, LanguageServerBinaryStatus};
+use language::{BinaryStatus, LanguageMatcher, LanguageRegistry};
 use lsp::LanguageServerName;
 use node_runtime::NodeRuntime;
 use parking_lot::Mutex;
@@ -25,7 +25,7 @@ use std::{
     sync::Arc,
 };
 use theme::ThemeRegistry;
-use util::test::temp_tree;
+use util::test::TempTree;
 
 #[cfg(test)]
 #[ctor::ctor]
@@ -149,6 +149,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
                         authors: Vec::new(),
                         repository: None,
                         themes: Default::default(),
+                        icon_themes: Vec::new(),
                         lib: Default::default(),
                         languages: vec!["languages/erb".into(), "languages/ruby".into()],
                         grammars: [
@@ -162,6 +163,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
                         slash_commands: BTreeMap::default(),
                         indexed_docs_providers: BTreeMap::default(),
                         snippets: None,
+                        capabilities: Vec::new(),
                     }),
                     dev: false,
                 },
@@ -181,6 +183,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
                             "themes/monokai-pro.json".into(),
                             "themes/monokai.json".into(),
                         ],
+                        icon_themes: Vec::new(),
                         lib: Default::default(),
                         languages: Default::default(),
                         grammars: BTreeMap::default(),
@@ -189,6 +192,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
                         slash_commands: BTreeMap::default(),
                         indexed_docs_providers: BTreeMap::default(),
                         snippets: None,
+                        capabilities: Vec::new(),
                     }),
                     dev: false,
                 },
@@ -258,6 +262,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
         ]
         .into_iter()
         .collect(),
+        icon_themes: BTreeMap::default(),
     };
 
     let proxy = Arc::new(ExtensionHostProxy::new());
@@ -267,7 +272,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
     language_extension::init(proxy.clone(), language_registry.clone());
     let node_runtime = NodeRuntime::unavailable();
 
-    let store = cx.new_model(|cx| {
+    let store = cx.new(|cx| {
         ExtensionStore::new(
             PathBuf::from("/the-extension-dir"),
             None,
@@ -344,6 +349,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
                 authors: vec![],
                 repository: None,
                 themes: vec!["themes/gruvbox.json".into()],
+                icon_themes: Vec::new(),
                 lib: Default::default(),
                 languages: Default::default(),
                 grammars: BTreeMap::default(),
@@ -352,6 +358,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
                 slash_commands: BTreeMap::default(),
                 indexed_docs_providers: BTreeMap::default(),
                 snippets: None,
+                capabilities: Vec::new(),
             }),
             dev: false,
         },
@@ -392,7 +399,7 @@ async fn test_extension_store(cx: &mut TestAppContext) {
 
     // Create new extension store, as if Zed were restarting.
     drop(store);
-    let store = cx.new_model(|cx| {
+    let store = cx.new(|cx| {
         ExtensionStore::new(
             PathBuf::from("/the-extension-dir"),
             None,
@@ -451,7 +458,12 @@ async fn test_extension_store(cx: &mut TestAppContext) {
     });
 }
 
+// todo(windows)
+// Disable this test on Windows for now. Because this test hangs at
+// `let fake_server = fake_servers.next().await.unwrap();`.
+// Reenable this test when we figure out why.
 #[gpui::test]
+#[cfg_attr(target_os = "windows", ignore)]
 async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();
@@ -466,11 +478,11 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
     let test_extension_dir = root_dir.join("extensions").join(test_extension_id);
 
     let fs = Arc::new(RealFs::default());
-    let extensions_dir = temp_tree(json!({
+    let extensions_dir = TempTree::new(json!({
         "installed": {},
         "work": {}
     }));
-    let project_dir = temp_tree(json!({
+    let project_dir = TempTree::new(json!({
         "test.gleam": ""
     }));
 
@@ -573,7 +585,7 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
     let builder_client =
         Arc::new(ReqwestClient::user_agent(&user_agent).expect("Could not create HTTP client"));
 
-    let extension_store = cx.new_model(|cx| {
+    let extension_store = cx.new(|cx| {
         ExtensionStore::new(
             extensions_dir.clone(),
             Some(cache_dir),
@@ -630,6 +642,8 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
         .await
         .unwrap();
 
+    // todo(windows)
+    // This test hangs here on Windows.
     let fake_server = fake_servers.next().await.unwrap();
     let expected_server_path =
         extensions_dir.join(format!("work/{test_extension_id}/gleam-v1.2.3/gleam"));
@@ -649,23 +663,14 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
             status_updates.next().await.unwrap(),
         ],
         [
-            (
-                LanguageServerName("gleam".into()),
-                LanguageServerBinaryStatus::CheckingForUpdate
-            ),
-            (
-                LanguageServerName("gleam".into()),
-                LanguageServerBinaryStatus::Downloading
-            ),
-            (
-                LanguageServerName("gleam".into()),
-                LanguageServerBinaryStatus::None
-            )
+            (SharedString::new("gleam"), BinaryStatus::CheckingForUpdate),
+            (SharedString::new("gleam"), BinaryStatus::Downloading),
+            (SharedString::new("gleam"), BinaryStatus::None)
         ]
     );
 
     // The extension creates custom labels for completion items.
-    fake_server.handle_request::<lsp::request::Completion, _, _>(|_, _| async move {
+    fake_server.set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move {
         Ok(Some(lsp::CompletionResponse::Array(vec![
             lsp::CompletionItem {
                 label: "foo".into(),
@@ -700,6 +705,7 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
         })
         .await
         .unwrap()
+        .unwrap()
         .into_iter()
         .map(|c| c.label.text)
         .collect::<Vec<_>>();
@@ -720,8 +726,9 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
 
     // Start a new instance of the language server.
     project.update(cx, |project, cx| {
-        project.restart_language_servers_for_buffers([buffer.clone()], cx)
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], cx)
     });
+    cx.executor().run_until_parked();
 
     // The extension has cached the binary path, and does not attempt
     // to reinstall it.
@@ -741,7 +748,7 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
 
     cx.executor().run_until_parked();
     project.update(cx, |project, cx| {
-        project.restart_language_servers_for_buffers([buffer.clone()], cx)
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], cx)
     });
 
     // The extension re-fetches the latest version of the language server.
@@ -765,6 +772,7 @@ fn init_test(cx: &mut TestAppContext) {
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         release_channel::init(SemanticVersion::default(), cx);
+        extension::init(cx);
         theme::init(theme::LoadThemes::JustBase, cx);
         Project::init_settings(cx);
         ExtensionSettings::register(cx);
