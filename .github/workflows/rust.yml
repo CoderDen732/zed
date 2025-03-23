@@ -30,7 +30,7 @@ jobs:
           rustup target add wasm32-wasip1
           cargo build --release 
     - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: zed-windows
         path: ${{ github.workspace }}/target/release/zed.exe
